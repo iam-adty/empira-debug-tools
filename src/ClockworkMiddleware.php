@@ -62,7 +62,97 @@ final class ClockworkMiddleware implements Middleware
 
         $this->profiler->source()->withResponse($response);
 
-        return $this->withHeaders($response, $this->profiler->record());
+        $id = $this->profiler->record();
+
+        return $this->addBar($request, $this->withHeaders($response, $id), $id);
+    }
+
+    /**
+     * Add the in-page bar, when there is a page to add it to.
+     *
+     * Three things have to be true, and each exclusion is deliberate:
+     *
+     * - **HTML.** A bar in a JSON body is not a bar, it is a corrupted
+     *   response.
+     * - **Not an htmx swap.** htmx replaces one region, and the response has no
+     *   `</body>` to append to; injecting anyway would produce a stray bar in a
+     *   fragment or nothing at all.
+     * - **A body tag exists.** A fragment has no closing body, and appending to
+     *   the end of one would put markup inside someone else's element.
+     *
+     * The numbers travel in the page rather than in a cookie:
+     * {@see Response::cookie()} replaces the `Set-Cookie` header instead of
+     * appending, so this running last in the pipeline would overwrite whatever
+     * cookie the application set while dispatching — a failure that would only
+     * ever show up on pages being debugged.
+     */
+    private function addBar(Request $request, Response $response, ?string $id): Response
+    {
+        if ($id === null || $request->isHtmx() || !$this->isHtml($response)) {
+            return $response;
+        }
+
+        if (!$this->profiler->isToolbarEnabled()) {
+            return $response;
+        }
+
+        $body = $response->body();
+        $at = strripos($body, '</body>');
+
+        if ($at === false) {
+            return $response;
+        }
+
+        $summary = $this->profiler->summary($id);
+
+        if ($summary === null) {
+            return $response;
+        }
+
+        // `JSON_HEX_TAG` matters here: the payload is embedded in a document, and
+        // a route name or URL containing `<` would otherwise close the element
+        // the data lives in.
+        $island = sprintf(
+            '<script type="application/json" id="%s">%s</script>',
+            DebugController::BAR_ID,
+            json_encode($summary, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES),
+        );
+
+        $markup = $island
+            . sprintf('<link rel="stylesheet" href="%s">', DebugController::TOOLBAR_CSS)
+            . sprintf('<script src="%s" defer></script>', DebugController::TOOLBAR_JS);
+
+        return $response->setBody(substr($body, 0, $at) . $markup . substr($body, $at));
+    }
+
+    /**
+     * Whether this response is a page rather than an API answer.
+     *
+     * **An absent `Content-Type` counts as HTML**, which is the surprising half.
+     * The framework sets none: a layout-rendered page and a handler returning a
+     * string both come back from `toResponse()` with the header unset, so
+     * requiring `text/html` would mean the bar never appeared on the pages it
+     * exists for.
+     *
+     * That is safe because of the `</body>` check in {@see addBar()} — JSON has
+     * no closing body tag, so a response that is not a page cannot be given a
+     * bar even if it is admitted through here. The two checks together are
+     * stricter than either alone: this one rejects an API that declares itself,
+     * the other rejects one that does not.
+     */
+    private function isHtml(Response $response): bool
+    {
+        foreach ($response->headers() as $name => $value) {
+            if (strcasecmp($name, 'content-type') !== 0) {
+                continue;
+            }
+
+            $type = strtolower($value);
+
+            return str_contains($type, 'text/html') || str_contains($type, 'application/xhtml');
+        }
+
+        return true;
     }
 
     /**

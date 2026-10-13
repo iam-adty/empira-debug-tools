@@ -75,13 +75,16 @@ final class DebugToolsModule implements Module, CommandProvider
         $controller = new DebugController($container->get(Profiler::class));
         $routes = $app->routes();
 
-        // Registration order is matching order. The API is declared before the
-        // catch-all asset route so a path beginning `api/` is answered as data
-        // even though it would also satisfy the catch-all.
+        // Registration order is matching order. The API and the bar's two files
+        // are declared before the catch-all asset route so a path beginning
+        // `api/` or ending `.js` is answered as itself, even though both would
+        // also satisfy `{path:.*}`.
         $routes->get(DebugController::PATH, [$controller, 'index'], 'debug.index', csrf: false);
         $routes->get(DebugController::PATH . '/api', [$controller, 'api'], 'debug.api', csrf: false);
         $routes->get(DebugController::PATH . '/api/{id}', [$controller, 'api'], 'debug.api.show', csrf: false);
         $routes->get(DebugController::PATH . '/api/{id}/{direction}/{count}', [$controller, 'api'], 'debug.api.page', csrf: false);
+        $routes->get(DebugController::TOOLBAR_JS, [$controller, 'toolbarJs'], 'debug.toolbar.js', csrf: false);
+        $routes->get(DebugController::TOOLBAR_CSS, [$controller, 'toolbarCss'], 'debug.toolbar.css', csrf: false);
         $routes->get(DebugController::PATH . '/app/{path:.*}', [$controller, 'asset'], 'debug.asset', csrf: false);
     }
 
@@ -104,7 +107,7 @@ final class DebugToolsModule implements Module, CommandProvider
             return (bool) $this->config['enabled'];
         }
 
-        $env = $this->config['environment'] ?? $_ENV['APP_ENV'] ?? getenv('APP_ENV');
+        $env = $this->config['environment'] ?? $_ENV['APP_ENV'] ?? null;
 
         return in_array(
             is_string($env) ? strtolower($env) : 'production',

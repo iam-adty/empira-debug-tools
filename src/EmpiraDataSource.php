@@ -123,7 +123,18 @@ final class EmpiraDataSource implements DataSourceInterface
             $request->responseStatus = $this->response->status();
         }
 
-        $request->responseTime = $this->startedAt > 0.0 ? microtime(true) : $request->responseTime;
+        // `responseTime` is when the handler finished. `responseDuration` is set
+        // explicitly rather than left to Clockwork's `getResponseDuration()`,
+        // which subtracts the `Request` object's own construction time — and
+        // that object is built in `Profiler::record()`, *after* the handler has
+        // run, so its idea of when the request started is when the recording
+        // started. Left alone, a handler that took five milliseconds would be
+        // reported as having taken the time it takes to serialise itself.
+        //
+        // Milliseconds, because that is what Clockwork's own computation
+        // produces; converting again here would report a thousandfold.
+        $request->responseTime = microtime(true);
+        $request->responseDuration = ($request->responseTime - $this->startedAt) * 1000;
         $request->memoryUsage = memory_get_peak_usage(true);
 
         if ($this->error !== null) {

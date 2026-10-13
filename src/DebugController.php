@@ -41,6 +41,14 @@ final class DebugController
     /** Where the SPA looks for its JSON. */
     private const API = self::PATH . '/api';
 
+    /** The element id the bar's data is injected as. */
+    public const BAR_ID = 'empira-debug';
+
+    /** The bar's two files, served by this module. */
+    public const TOOLBAR_JS = self::PATH . '/toolbar.js';
+
+    public const TOOLBAR_CSS = self::PATH . '/toolbar.css';
+
     public function __construct(
         private readonly Profiler $profiler,
     ) {
@@ -143,5 +151,46 @@ final class DebugController
         // properties, which are a different shape from the one its own
         // interface expects.
         return Response::json($data instanceof ClockworkRequest ? $data->toArray() : $data);
+    }
+
+    /**
+     * The in-page bar's script.
+     *
+     * A route that takes nothing and returns one known file, deliberately. The
+     * Clockwork asset route above has to defend against a path, because it is
+     * handed one; these two have nothing to defend, and inventing a `{file}`
+     * parameter to be careful with would be a way to have a traversal bug rather
+     * than a way to avoid one.
+     */
+    public function toolbarJs(): Response
+    {
+        return $this->barAsset('toolbar.js', 'text/javascript');
+    }
+
+    public function toolbarCss(): Response
+    {
+        return $this->barAsset('toolbar.css', 'text/css');
+    }
+
+    /**
+     * Cacheable, because the content changes only when the package is upgraded.
+     * `Response::cache()` emits the max-age itself rather than leaving it to the
+     * browser's own heuristics.
+     */
+    private function barAsset(string $file, string $mime): Response
+    {
+        $contents = @file_get_contents(dirname(__DIR__) . '/resources/' . $file);
+
+        if ($contents === false) {
+            // The package is installed but incomplete. A 404 is the honest
+            // answer, and the bar's script tag is already in the page either
+            // way — a script that throws on load is worse than one that was
+            // never requested.
+            return Response::html('Not found', 404);
+        }
+
+        return Response::html($contents)
+            ->withHeader('Content-Type', $mime)
+            ->cache(86400);
     }
 }

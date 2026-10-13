@@ -86,6 +86,54 @@ final class Profiler
         return $this->enabled;
     }
 
+    /**
+     * Whether the in-page bar is wanted.
+     *
+     * Separate from {@see isEnabled()} because they answer different questions.
+     * Recording is what this module is for and is not optional while it is on;
+     * the bar *decorates a page someone else designed*, which is a different
+     * thing to have done to an application without asking, and one an
+     * application with its own footer would reasonably want to decline.
+     *
+     * @param array<string, mixed> $config
+     */
+    public function isToolbarEnabled(array $config = []): bool
+    {
+        return (bool) ($config['toolbar'] ?? $this->config['toolbar'] ?? true);
+    }
+
+    /**
+     * The handful of numbers the in-page bar shows.
+     *
+     * Read back from the stored request rather than carried through
+     * {@see record()} as a second return value: duration and memory are measured
+     * during {@see Clockwork::resolveRequest()}, so they only exist there, and
+     * passing them out by hand would mean reporting a different number from the
+     * one stored on disk.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function summary(?string $id = null): ?array
+    {
+        if (!$this->enabled) {
+            return null;
+        }
+
+        $request = $this->clockwork->request();
+
+        if ($id === null || $request === null || $request->id !== $id) {
+            return null;
+        }
+
+        return [
+            'id' => $request->id,
+            'status' => $request->responseStatus,
+            'duration_ms' => round($request->responseDuration ?? 0.0, 1),
+            'memory_mb' => round(($request->memoryUsage ?? 0) / 1048576, 1),
+            'route' => $request->controller,
+        ];
+    }
+
     public function clockwork(): Clockwork
     {
         return $this->clockwork;
@@ -182,18 +230,22 @@ final class Profiler
     }
 
     /**
-     * The environment name, as the rest of the workspace reads it.
+ * The environment name, read from `$_ENV` and from nowhere else.
  *
- * `$_ENV` first because that is what every other package here reads — the
- * framework's own configuration, the skeleton's logging setup — and a profiler
- * that disagreed with the application about which environment it is running in
- * would be deciding to record against a different answer than everything else
- * already gave. `getenv()` second, for a process variable that arrived without
- * populating the superglobal.
+ * No `getenv()` fallback. This was the only `getenv()` in the workspace, and it
+ * was a hole: the application strips its inherited configuration before reading
+ * `.env` (`App::CONFIG_KEYS`), so a value arriving through the process
+ * environment is one the application never saw — and a profiler deciding whether
+ * to write every request to disk should decide on the same answer the
+ * application gave, not a second one gathered behind its back.
+ *
+ * An unset `APP_ENV` reads as absent, which {@see DebugToolsModule} treats as
+ * production and therefore disabled. A module that ran because nothing was set
+ * would be a module that ran on a server whose operator set nothing at all.
  */
 private function environment(): string
     {
-        $env = $this->config['environment'] ?? $_ENV['APP_ENV'] ?? getenv('APP_ENV');
+        $env = $this->config['environment'] ?? $_ENV['APP_ENV'] ?? null;
 
         return is_string($env) ? strtolower($env) : 'production';
     }

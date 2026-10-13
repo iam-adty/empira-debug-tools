@@ -237,6 +237,137 @@ final class DebugToolsTest extends TestCase
         $this->assertStringContainsString('no requests', $this->readOutput($stream));
     }
 
+    // ------------------------------------------------------------- the in-page bar
+
+    public function testAPageGetsTheBar(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/page', fn (): Response => Response::html('<html><body><p>hi</p></body></html>'));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        $this->assertStringContainsString('id="empira-debug"', $body);
+        $this->assertStringContainsString(DebugController::TOOLBAR_JS, $body);
+        $this->assertStringContainsString(DebugController::TOOLBAR_CSS, $body);
+    }
+
+    public function testTheBarCarriesTheNumbersTheInterfaceShows(): void
+    {
+        $app = $this->app();
+
+        // Two milliseconds of handler. An instant closure would report 0.0ms
+        // whether the duration is measured correctly or not, so this assertion
+        // would pass against the bug it exists to catch: a data source whose
+        // Clockwork request is built after the handler has already run measures
+        // the recording, not the request.
+        $app->routes()->get('/page', function (): Response {
+            usleep(2000);
+
+            return Response::html('<body>x</body>');
+        }, 'page.index');
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        preg_match('/id="empira-debug">(.*?)<\/script>/s', $body, $island);
+        $data = json_decode($island[1] ?? '', true);
+
+        $this->assertSame(200, $data['status'] ?? null);
+        $this->assertSame('page.index', $data['route'] ?? null);
+        $this->assertGreaterThan(1.5, $data['duration_ms'] ?? 0, 'the handler took ~2ms');
+    }
+
+    public function testTheBarIsInjectedBeforeTheClosingBodyTag(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/page', fn (): Response => Response::html('<html><body><p>hi</p></body></html>'));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        $this->assertLessThan(
+            strrpos($body, '</body>'),
+            strpos($body, 'id="empira-debug"'),
+            'the bar must go inside the body, or a browser will hoist it into the head',
+        );
+    }
+
+    public function testAJsonResponseGetsNoBar(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/api', fn (): Response => Response::json(['ok' => true]));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/api'))->body();
+
+        $this->assertStringNotContainsString('empira-debug', $body);
+    }
+
+    public function testAnHtmxSwapGetsNoBar(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/fragment', fn (): Response => Response::html('<div>swap</div>'));
+
+        $body = $app->handle(new Request(
+            method: 'GET',
+            uri: '/fragment',
+            headers: ['HX-Request' => 'true'],
+        ))->body();
+
+        // htmx replaces one region; a bar injected into a swapped fragment would
+        // either land in the wrong place or nowhere at all.
+        $this->assertStringNotContainsString('empira-debug', $body);
+    }
+
+    public function testAFragmentWithNoBodyTagIsLeftAlone(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/fragment', fn (): Response => Response::html('<div>swap</div>'));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/fragment'))->body();
+
+        $this->assertSame('<div>swap</div>', $body);
+    }
+
+    public function testNoBarWhenTheModuleIsDisabled(): void
+    {
+        $app = $this->app(enabled: false);
+        $app->routes()->get('/page', fn (): Response => Response::html('<body>x</body>'));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        $this->assertStringNotContainsString('empira-debug', $body);
+    }
+
+    public function testTheBarCanBeDeclinedWhileRecordingContinues(): void
+    {
+        $app = $this->app(toolbar: false);
+        $app->routes()->get('/page', fn (): Response => Response::html('<body>x</body>'));
+
+        $response = $app->handle(new Request(method: 'GET', uri: '/page'));
+
+        $this->assertStringNotContainsString('empira-debug', $response->body());
+        // Declining to decorate a page is not declining to profile the request.
+        $this->assertNotEmpty($this->latestOf($app));
+    }
+
+    public function testTheBarAssetsAreServedWithTheRightType(): void
+    {
+        $app = $this->app();
+
+        foreach ([DebugController::TOOLBAR_JS => 'text/javascript', DebugController::TOOLBAR_CSS => 'text/css'] as $path => $mime) {
+            $response = $app->handle(new Request(method: 'GET', uri: $path));
+
+            $this->assertSame(200, $response->status(), $path);
+            $this->assertSame($mime, $response->headers()['Content-Type'] ?? null, $path);
+            $this->assertNotSame('', $response->body(), $path);
+        }
+    }
+
+    public function testTheBarAssetsAreNotRoutableWhenDisabled(): void
+    {
+        $app = $this->app(enabled: false);
+
+        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::TOOLBAR_JS))->status());
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /**
@@ -265,11 +396,17 @@ final class DebugToolsTest extends TestCase
         return stream_get_contents($stream);
     }
 
-    private function app(bool $enabled = true): Application
+    private function app(bool $enabled = true, ?bool $toolbar = null): Application
     {
+        $config = ['enabled' => $enabled];
+
+        if ($toolbar !== null) {
+            $config['toolbar'] = $toolbar;
+        }
+
         $app = new Application('a-secret-that-is-long-enough');
 
-        $app->module(new DebugToolsModule($this->basePath, ['enabled' => $enabled]));
+        $app->module(new DebugToolsModule($this->basePath, $config));
 
         return $app;
     }

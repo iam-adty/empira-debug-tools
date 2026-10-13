@@ -63,6 +63,29 @@ naming the stored profile.
 The interface is at `/_clockwork`, and it is Clockwork's own — the part worth
 looking at is the timeline and the request/response detail.
 
+## The bar in the page
+
+HTML responses also get a small bar along the bottom of the viewport, carrying
+the status, the route, the duration and the peak memory, with a link through to
+the interface. Clicking the link opens it in a new tab, so the page you were
+looking at is still there afterwards.
+
+```php
+new DebugToolsModule(__DIR__ . '/..', ['toolbar' => false]);   // record, but leave pages alone
+```
+
+Recording is what this module is for; the bar *decorates a page somebody else
+designed*, which is a different thing to have done to your application without
+asking. An application with its own footer may reasonably want to decline it
+while keeping the recording.
+
+The bar is deliberately small and this module is deliberately the only JavaScript
+in the package. No framework, no build step, and nothing to install — an
+application that installs a profiler during development should not acquire a
+toolchain to do it. If you would rather use
+[Clockwork's own toolbar](https://underground.works/clockwork/), that is a
+separate npm or CDN component, and this package does not pull it in.
+
 ## It only runs when you asked for it
 
 Nothing is registered unless `APP_ENV` is one of `local`, `dev`, `development` or
@@ -70,6 +93,11 @@ Nothing is registered unless `APP_ENV` is one of `local`, `dev`, `development` o
 routes exist at all* rather than what they answer — so in production there is no
 URL to probe and no directory to serve, instead of a URL that is present and
 refuses.
+
+`APP_ENV` is read from `$_ENV` and from nothing else. This matches how the
+framework's own configuration and the skeleton's are read, so the profiler cannot
+reach a different answer about the environment than the application it is
+profiling.
 
 ```php
 new DebugToolsModule(__DIR__ . '/..', ['enabled' => true]);   // force on
