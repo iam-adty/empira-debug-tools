@@ -63,28 +63,70 @@ naming the stored profile.
 The interface is at `/_clockwork`, and it is Clockwork's own — the part worth
 looking at is the timeline and the request/response detail.
 
-## The bar in the page
+## Reading a profile
 
-HTML responses also get a small bar along the bottom of the viewport, carrying
-the status, the route, the duration and the peak memory, with a link through to
-the interface. Clicking the link opens it in a new tab, so the page you were
-looking at is still there afterwards.
+Use the **Clockwork Chrome extension** — the one Clockwork publishes for
+[its own project](https://underground.works/clockwork/). It reads three headers
+off each response and fetches the data itself:
+
+| Header | Meaning |
+|---|---|
+| `X-Clockwork-Id` | the id this request was stored under |
+| `X-Clockwork-Version` | the Clockwork version that stored it |
+| `X-Clockwork-Path` | the API base to fetch from — **not** the URL prefix |
+
+A client appends the id to that path, so the data lives at
+`/_clockwork/api/{id}`, and `/_clockwork/api/latest`, and
+`/_clockwork/api/{id}/previous/5`. Those are the URLs, not decoration: a
+`debug:clear` empties them and nothing else.
+
+**This package ships no JavaScript and injects nothing into your pages.** That is
+upstream's position too — Clockwork's own in-page toolbar is a separate npm or
+CDN component, which this does not pull in. Your responses come back exactly as
+the handler wrote them.
+
+## Saying something while debugging
+
+`Empira\DebugTools\Debug` is for the lines you want explained.
 
 ```php
-new DebugToolsModule(__DIR__ . '/..', ['toolbar' => false]);   // record, but leave pages alone
+use Empira\DebugTools\Debug;
+
+Debug::mark('cache miss', ['key' => $key]);
+
+$user = Debug::measure('find user', fn (): ?User => $this->find($id));
+
+Debug::warning('falling back to the v1 parser', ['version' => 1]);
 ```
 
-Recording is what this module is for; the bar *decorates a page somebody else
-designed*, which is a different thing to have done to your application without
-asking. An application with its own footer may reasonably want to decline it
-while keeping the recording.
+| Call | Does |
+|---|---|
+| `Debug::mark($label, $data)` | a point on the timeline; repeats stay separate |
+| `Debug::measure($label, $fn, ...$args)` | times `$fn` and **returns its value** |
+| `Debug::span($label, $data)` | a span for timing what a closure cannot wrap |
+| `Debug::info/debug/warning/error($msg, $ctx)` | a message with a level and a stack trace |
+| `Debug::enabled()` | whether anything is being recorded |
 
-The bar is deliberately small and this module is deliberately the only JavaScript
-in the package. No framework, no build step, and nothing to install — an
-application that installs a profiler during development should not acquire a
-toolchain to do it. If you would rather use
-[Clockwork's own toolbar](https://underground.works/clockwork/), that is a
-separate npm or CDN component, and this package does not pull it in.
+A span for an import spread across four methods:
+
+```php
+$span = Debug::span('import');
+
+foreach ($rows as $row) {
+    $this->import($row);
+    $span?->data(['done' => ++$n]);
+}
+
+$span?->data(['rows' => $n])?->end();
+```
+
+Everything is a no-op outside a request being recorded — and `measure()` still
+runs its callback and returns its value, because a debugging tool that changed
+what your application does when switched off would be a bug in the tool. Guard an
+expensive payload with `Debug::enabled()`.
+
+Marks have to happen *during* the request; they are written when the request is
+stored. Console commands are not profiled, so marks in one are discarded.
 
 ## It only runs when you asked for it
 
@@ -149,3 +191,9 @@ composer test
 
 On the host PHP against SQLite, needing no server and no container — which is
 the point of it being a module rather than an application.
+
+Most of the suite asserts against the **stored profile** rather than the objects
+that produced it, and one test performs the Chrome extension's exact journey —
+read the headers, build `{X-Clockwork-Path}/{X-Clockwork-Id}`, request it — so
+the contract a browser depends on is pinned by something that would fail the
+moment it stopped working.

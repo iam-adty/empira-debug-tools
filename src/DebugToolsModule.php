@@ -75,16 +75,16 @@ final class DebugToolsModule implements Module, CommandProvider
         $controller = new DebugController($container->get(Profiler::class));
         $routes = $app->routes();
 
-        // Registration order is matching order. The API and the bar's two files
-        // are declared before the catch-all asset route so a path beginning
-        // `api/` or ending `.js` is answered as itself, even though both would
-        // also satisfy `{path:.*}`.
-        $routes->get(DebugController::PATH, [$controller, 'index'], 'debug.index', csrf: false);
-        $routes->get(DebugController::PATH . '/api', [$controller, 'api'], 'debug.api', csrf: false);
-        $routes->get(DebugController::PATH . '/api/{id}', [$controller, 'api'], 'debug.api.show', csrf: false);
-        $routes->get(DebugController::PATH . '/api/{id}/{direction}/{count}', [$controller, 'api'], 'debug.api.page', csrf: false);
-        $routes->get(DebugController::TOOLBAR_JS, [$controller, 'toolbarJs'], 'debug.toolbar.js', csrf: false);
-        $routes->get(DebugController::TOOLBAR_CSS, [$controller, 'toolbarCss'], 'debug.toolbar.css', csrf: false);
+        // Registration order is matching order, so the API is declared before the
+        // catch-all asset route: a path beginning `api/` is answered as data even
+        // though it would also satisfy `{path:.*}`.
+        //
+        // There is no HTML page here. Nothing is injected into an application's
+        // responses and this package ships no JavaScript — a Clockwork client
+        // reads the `X-Clockwork-*` headers and fetches the JSON from below.
+        $routes->get(DebugController::API, [$controller, 'api'], 'debug.api', csrf: false);
+        $routes->get(DebugController::API . '/{id}', [$controller, 'api'], 'debug.api.show', csrf: false);
+        $routes->get(DebugController::API . '/{id}/{direction}/{count}', [$controller, 'api'], 'debug.api.page', csrf: false);
         $routes->get(DebugController::PATH . '/app/{path:.*}', [$controller, 'asset'], 'debug.asset', csrf: false);
     }
 

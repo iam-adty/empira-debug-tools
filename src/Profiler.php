@@ -33,6 +33,9 @@ final class Profiler
 
     private readonly EmpiraDataSource $source;
 
+    /** Where a developer's marks go until the request is stored. */
+    private readonly Marks $marks;
+
     private readonly bool $enabled;
 
     /** @var array<string, mixed> */
@@ -59,7 +62,8 @@ final class Profiler
         // single request and unbounded under a worker that serves a few thousand
         // before it recycles. One source, reused, is what the interface assumes
         // anyway: it is told one request, not several.
-        $this->source = new EmpiraDataSource();
+        $this->marks = new Marks();
+        $this->source = new EmpiraDataSource($this->marks);
         $this->clockwork->addDataSource($this->source);
 
         // Nothing here serves the UI, so the authenticator is never consulted:
@@ -81,57 +85,21 @@ final class Profiler
         return $this->source;
     }
 
+    /**
+     * The collector {@see Debug} writes to.
+     *
+     * Exposed so the middleware can put it in front of the application for the
+     * duration of a request and take it away afterwards. Nothing else should
+     * need it: {@see Debug} is the way in.
+     */
+    public function marks(): Marks
+    {
+        return $this->marks;
+    }
+
     public function isEnabled(): bool
     {
         return $this->enabled;
-    }
-
-    /**
-     * Whether the in-page bar is wanted.
-     *
-     * Separate from {@see isEnabled()} because they answer different questions.
-     * Recording is what this module is for and is not optional while it is on;
-     * the bar *decorates a page someone else designed*, which is a different
-     * thing to have done to an application without asking, and one an
-     * application with its own footer would reasonably want to decline.
-     *
-     * @param array<string, mixed> $config
-     */
-    public function isToolbarEnabled(array $config = []): bool
-    {
-        return (bool) ($config['toolbar'] ?? $this->config['toolbar'] ?? true);
-    }
-
-    /**
-     * The handful of numbers the in-page bar shows.
-     *
-     * Read back from the stored request rather than carried through
-     * {@see record()} as a second return value: duration and memory are measured
-     * during {@see Clockwork::resolveRequest()}, so they only exist there, and
-     * passing them out by hand would mean reporting a different number from the
-     * one stored on disk.
-     *
-     * @return array<string, mixed>|null
-     */
-    public function summary(?string $id = null): ?array
-    {
-        if (!$this->enabled) {
-            return null;
-        }
-
-        $request = $this->clockwork->request();
-
-        if ($id === null || $request === null || $request->id !== $id) {
-            return null;
-        }
-
-        return [
-            'id' => $request->id,
-            'status' => $request->responseStatus,
-            'duration_ms' => round($request->responseDuration ?? 0.0, 1),
-            'memory_mb' => round(($request->memoryUsage ?? 0) / 1048576, 1),
-            'route' => $request->controller,
-        ];
     }
 
     public function clockwork(): Clockwork
@@ -196,6 +164,7 @@ final class Profiler
             // and a profiler that is careful on the happy path is not careful on
             // the one that threw.
             $this->source->reset();
+            $this->marks->reset();
         }
     }
 

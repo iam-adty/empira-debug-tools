@@ -10,17 +10,23 @@ use Empira\Http\Request;
 use Empira\Http\Response;
 
 /**
- * Serves the Clockwork interface and the data behind it.
+ * Serves the data behind a Clockwork profile, and Clockwork's own assets.
  *
- * ## One unguessable prefix, three routes
+ * ## The shape mirrors Clockwork's
  *
- * Clockwork's UI is a prebuilt single-page app that fetches its data as JSON.
- * So the prefix serves three things and nothing else: the wrapper page, the app's
- * own assets, and the API. Putting them under one guessable path is the whole
- * attack surface here, which is why {@see PATH} carries a random-looking
- * segment rather than being `/debug`.
+ * `/__clockwork/{id}`, `/__clockwork/latest`, `/__clockwork/{id}/previous/5` is
+ * what Clockwork's Slim and Laravel integrations expose, and what its clients
+ * expect — the Chrome extension reads `X-Clockwork-Path` and appends an id to it.
+ * The same family is reproduced under {@see PATH} so the prefix can be ours.
  *
- * ## The app's assets are not served from the vendor directory
+ * ## Nothing is injected into a page
+ *
+ * There is no in-page toolbar here, and this package ships no JavaScript. Upstream
+ * is deliberate about that too — its own toolbar is a separate npm or CDN
+ * component, not part of the Composer package — so the browser side is somebody
+ * else's decision and this one serves data.
+ *
+ * ## The app's assets are read from vendor, not installed into it
  *
  * Clockwork ships an installer that copies its UI into the application's public
  * directory. That was not used: it puts a second copy of a third party's files
@@ -32,69 +38,26 @@ use Empira\Http\Response;
 final class DebugController
 {
     /**
-     * The URL prefix. Generated per installation — see {@see self::generatePath()} —
-     * because the route existing at all is the only thing protecting it, and a
-     * fixed name is a name that ends up in a search engine index.
+     * The URL prefix, and the only thing protecting the recorded data.
+     *
+     * Nothing checks a token before answering. That is the design: the route
+     * either exists or it does not, and it does not exist unless the environment
+     * said to publish it, so there is no authorisation to forget.
      */
     public const PATH = '/_clockwork';
 
-    /** Where the SPA looks for its JSON. */
-    private const API = self::PATH . '/api';
-
-    /** The element id the bar's data is injected as. */
-    public const BAR_ID = 'empira-debug';
-
-    /** The bar's two files, served by this module. */
-    public const TOOLBAR_JS = self::PATH . '/toolbar.js';
-
-    public const TOOLBAR_CSS = self::PATH . '/toolbar.css';
+    /**
+     * Where the recorded data is served, and what `X-Clockwork-Path` advertises.
+     *
+     * Public because the middleware writes it into that header, and it is
+     * exactly the value a client appends an id to — so it is not an internal
+     * detail that can drift from the route table.
+     */
+    public const API = self::PATH . '/api';
 
     public function __construct(
         private readonly Profiler $profiler,
     ) {
-    }
-
-    /**
-     * The wrapper page.
-     *
-     * Clockwork's own wrapper is a full-viewport iframe around its SPA, with the
-     * API path handed over through `localStorage` because that is the only
-     * channel the prebuilt bundle reads. Rewritten rather than included from
-     * `Clockwork\Support\Vanilla\iframe.html.php`: that file is another
-     * package's internal, not an API, and a path inside someone's `Support`
-     * directory is the kind of thing that moves in a minor release.
-     */
-    public function index(): Response
-    {
-        $asset = fn (string $uri): string => self::PATH . '/app/' . $uri;
-        $api = self::API;
-
-        $html = <<<HTML
-        <!DOCTYPE html>
-        <html lang="en">
-            <head>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>Clockwork</title>
-                <link rel="icon" href="{$asset('img/icon-128x128.png')}">
-                <style>
-                    iframe {{ position: fixed; top: 0; left: 0; height: 100%; width: 100%; border: 0; }}
-                </style>
-            </head>
-            <body>
-                <iframe src="{$asset('index.html')}"></iframe>
-                <script>
-                    let data = JSON.parse(localStorage.getItem('clockwork') || '{{}}')
-                    data.settings = data.settings || {{}}
-                    data.settings.global = data.settings.global || {{}}
-                    data.settings.global.metadataPath = '{$api}'
-                    localStorage.setItem('clockwork', JSON.stringify(data))
-                </script>
-            </body>
-        </html>
-        HTML;
-
-        return Response::html($html)->noStore();
     }
 
     /**
@@ -146,51 +109,42 @@ final class DebugController
             default => $storage->find($id),
         };
 
-        // `Request` is not JsonSerializable — Clockwork offers `toArray()`, and
-        // handing the object straight to json_encode would encode its public
-        // properties, which are a different shape from the one its own
-        // interface expects.
-        return Response::json($data instanceof ClockworkRequest ? $data->toArray() : $data);
-    }
-
-    /**
-     * The in-page bar's script.
-     *
-     * A route that takes nothing and returns one known file, deliberately. The
-     * Clockwork asset route above has to defend against a path, because it is
-     * handed one; these two have nothing to defend, and inventing a `{file}`
-     * parameter to be careful with would be a way to have a traversal bug rather
-     * than a way to avoid one.
-     */
-    public function toolbarJs(): Response
-    {
-        return $this->barAsset('toolbar.js', 'text/javascript');
-    }
-
-    public function toolbarCss(): Response
-    {
-        return $this->barAsset('toolbar.css', 'text/css');
-    }
-
-    /**
-     * Cacheable, because the content changes only when the package is upgraded.
-     * `Response::cache()` emits the max-age itself rather than leaving it to the
-     * browser's own heuristics.
-     */
-    private function barAsset(string $file, string $mime): Response
-    {
-        $contents = @file_get_contents(dirname(__DIR__) . '/resources/' . $file);
-
-        if ($contents === false) {
-            // The package is installed but incomplete. A 404 is the honest
-            // answer, and the bar's script tag is already in the page either
-            // way — a script that throws on load is worse than one that was
-            // never requested.
-            return Response::html('Not found', 404);
+        // An unknown id is `false`, not null, and an empty history is an empty
+        // array. Both mean the same thing to a client: there is no such request.
+        // Answering `null` with a 200 would let a client cache "no such request"
+        // as though it were data.
+        if ($data === false || $data === [] || $data === null) {
+            return Response::json(['message' => 'No such request.'], 404);
         }
 
-        return Response::html($contents)
-            ->withHeader('Content-Type', $mime)
-            ->cache(86400);
+        return Response::json($this->normalise($data));
+    }
+
+    /**
+     * Clockwork's storage answers with `Request` objects, or with arrays of them
+     * for `previous()` and `next()` — and `Request` is **not** `JsonSerializable`.
+     *
+     * Both shapes have to be mapped, not just the single one. Passing an array
+     * straight to `json_encode` encodes each object's *public properties*, which
+     * is a subtly different document from `toArray()`: the computed fields are
+     * missing entirely, so a paging request would report no duration and no
+     * query counts for records that have them.
+     *
+     * @return array<array-key, mixed>|null
+     */
+    private function normalise(mixed $data): ?array
+    {
+        if ($data instanceof ClockworkRequest) {
+            return $data->toArray();
+        }
+
+        if (is_array($data)) {
+            return array_map(
+                static fn (mixed $item): mixed => $item instanceof ClockworkRequest ? $item->toArray() : $item,
+                $data,
+            );
+        }
+
+        return null;
     }
 }

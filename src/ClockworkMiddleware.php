@@ -12,7 +12,8 @@ use Empira\Http\Response;
 use Empira\Routing\RouteCollection;
 
 /**
- * Records every request through the profiler.
+ * Records every request through the profiler, and puts {@see Debug} in reach of
+ * the application while doing it.
  *
  * ## Why a middleware, and why this one
  *
@@ -46,113 +47,34 @@ final class ClockworkMiddleware implements Middleware
 
         $this->profiler->source()->begin($request, $this->matchRoute($request));
 
+        // The developer-facing `Debug` facade writes here, and only for the
+        // duration of this request. Set after `begin()` so a mark cannot land on
+        // a profile that has not started, and cleared in the `finally` below so a
+        // mark can never survive into the next request — under a worker that would
+        // be one request annotating another, which is worse than losing it.
+        Debug::activate($this->profiler->marks());
+
         try {
-            $response = $next($request);
-        } catch (\Throwable $e) {
-            $this->profiler->source()->logError($e);
+            try {
+                $response = $next($request);
+            } catch (\Throwable $e) {
+                $this->profiler->source()->logError($e);
 
-            // Recorded, then re-thrown untouched. No headers here: there is no
-            // response yet to put them on, and the application's error renderer
-            // runs outside this pipeline and does not know this module exists.
-            // The profile exists and names the failure, which is what matters.
-            $this->profiler->record();
+                // Recorded, then re-thrown untouched. No headers here: there is no
+                // response yet to put them on, and the application's error renderer
+                // runs outside this pipeline and does not know this module exists.
+                // The profile exists and names the failure, which is what matters.
+                $this->profiler->record();
 
-            throw $e;
-        }
-
-        $this->profiler->source()->withResponse($response);
-
-        $id = $this->profiler->record();
-
-        return $this->addBar($request, $this->withHeaders($response, $id), $id);
-    }
-
-    /**
-     * Add the in-page bar, when there is a page to add it to.
-     *
-     * Three things have to be true, and each exclusion is deliberate:
-     *
-     * - **HTML.** A bar in a JSON body is not a bar, it is a corrupted
-     *   response.
-     * - **Not an htmx swap.** htmx replaces one region, and the response has no
-     *   `</body>` to append to; injecting anyway would produce a stray bar in a
-     *   fragment or nothing at all.
-     * - **A body tag exists.** A fragment has no closing body, and appending to
-     *   the end of one would put markup inside someone else's element.
-     *
-     * The numbers travel in the page rather than in a cookie:
-     * {@see Response::cookie()} replaces the `Set-Cookie` header instead of
-     * appending, so this running last in the pipeline would overwrite whatever
-     * cookie the application set while dispatching — a failure that would only
-     * ever show up on pages being debugged.
-     */
-    private function addBar(Request $request, Response $response, ?string $id): Response
-    {
-        if ($id === null || $request->isHtmx() || !$this->isHtml($response)) {
-            return $response;
-        }
-
-        if (!$this->profiler->isToolbarEnabled()) {
-            return $response;
-        }
-
-        $body = $response->body();
-        $at = strripos($body, '</body>');
-
-        if ($at === false) {
-            return $response;
-        }
-
-        $summary = $this->profiler->summary($id);
-
-        if ($summary === null) {
-            return $response;
-        }
-
-        // `JSON_HEX_TAG` matters here: the payload is embedded in a document, and
-        // a route name or URL containing `<` would otherwise close the element
-        // the data lives in.
-        $island = sprintf(
-            '<script type="application/json" id="%s">%s</script>',
-            DebugController::BAR_ID,
-            json_encode($summary, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES),
-        );
-
-        $markup = $island
-            . sprintf('<link rel="stylesheet" href="%s">', DebugController::TOOLBAR_CSS)
-            . sprintf('<script src="%s" defer></script>', DebugController::TOOLBAR_JS);
-
-        return $response->setBody(substr($body, 0, $at) . $markup . substr($body, $at));
-    }
-
-    /**
-     * Whether this response is a page rather than an API answer.
-     *
-     * **An absent `Content-Type` counts as HTML**, which is the surprising half.
-     * The framework sets none: a layout-rendered page and a handler returning a
-     * string both come back from `toResponse()` with the header unset, so
-     * requiring `text/html` would mean the bar never appeared on the pages it
-     * exists for.
-     *
-     * That is safe because of the `</body>` check in {@see addBar()} — JSON has
-     * no closing body tag, so a response that is not a page cannot be given a
-     * bar even if it is admitted through here. The two checks together are
-     * stricter than either alone: this one rejects an API that declares itself,
-     * the other rejects one that does not.
-     */
-    private function isHtml(Response $response): bool
-    {
-        foreach ($response->headers() as $name => $value) {
-            if (strcasecmp($name, 'content-type') !== 0) {
-                continue;
+                throw $e;
             }
 
-            $type = strtolower($value);
+            $this->profiler->source()->withResponse($response);
 
-            return str_contains($type, 'text/html') || str_contains($type, 'application/xhtml');
+            return $this->withHeaders($response, $this->profiler->record());
+        } finally {
+            Debug::deactivate();
         }
-
-        return true;
     }
 
     /**
@@ -168,11 +90,20 @@ final class ClockworkMiddleware implements Middleware
     }
 
     /**
-     * Add the headers the browser UI reads to find its own data.
+     * Add the headers a Clockwork client reads to find this request's data.
+     *
+     * This is the whole integration with the Chrome extension, and
+     * `X-Clockwork-Path` is the part that is easy to get wrong. A client parses
+     * these three headers for `{id, path, version}` and then asks for
+     * `{path}/{id}` — Clockwork's own value for `path` is `/__clockwork/`, and its
+     * server answers `/__clockwork/{id}`. So the header is the **API base**, not
+     * the prefix the interface is mounted at, and sending {@see
+     * DebugController::PATH} would point every client at a route that does not
+     * exist.
      *
      * `Server-Timing` is the one that pays for itself: browsers surface it in
      * the network panel for every page load, so the profiler is visible without
-     * being visited.
+     * anything being opened.
      */
     private function withHeaders(Response $response, ?string $id): Response
     {
@@ -183,7 +114,7 @@ final class ClockworkMiddleware implements Middleware
         return $response
             ->withHeader('X-Clockwork-Id', $id)
             ->withHeader('X-Clockwork-Version', \Clockwork\Clockwork::VERSION)
-            ->withHeader('X-Clockwork-Path', DebugController::PATH)
+            ->withHeader('X-Clockwork-Path', DebugController::API)
             ->withHeader(
                 'Server-Timing',
                 ServerTiming::fromRequest($this->profiler->clockwork()->request())->value(),

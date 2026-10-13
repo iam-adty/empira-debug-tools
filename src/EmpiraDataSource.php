@@ -32,6 +32,9 @@ use Empira\Routing\Route;
  */
 final class EmpiraDataSource implements DataSourceInterface
 {
+    /** What the developer said, flushed into the profile on resolve. */
+    private readonly Marks $marks;
+
     private ?Request $request = null;
 
     private ?Response $response = null;
@@ -43,6 +46,17 @@ final class EmpiraDataSource implements DataSourceInterface
     private ?\Throwable $error = null;
 
     private string $errorMessage = '';
+
+    /**
+     * @param Marks|null $marks shared with {@see Debug} through the {@see Profiler},
+     *                           so a mark made during the request is the one that
+     *                           gets flushed; defaulted so the data source is still
+     *                           constructible on its own in a test
+     */
+    public function __construct(?Marks $marks = null)
+    {
+        $this->marks = $marks ?? new Marks();
+    }
 
     /** Collect POST bodies. Off by default; see the class docblock. */
     public bool $collectPayloads = false;
@@ -104,6 +118,22 @@ final class EmpiraDataSource implements DataSourceInterface
 
         $empira = $this->request;
 
+        // ## Why `time` is overwritten before anything is measured
+        //
+        // `Clockwork\Request\Request::__construct()` sets `$time` to now, and
+        // this object is built in `Profiler::record()` — *after* the handler has
+        // run. `Clockwork::resolveRequest()` then calls
+        // `timeline()->finalize($request->time)`, and `Event::finalize()` clamps:
+        //
+        //     if ($this->start < $start) $this->start = $start;
+        //
+        // Every event the application produced during the handler started
+        // *before* that, so each one would be dragged forward onto the instant
+        // recording began and given a duration of zero. The request's real start
+        // is `$startedAt`, and claiming it here puts the whole timeline back
+        // where it happened.
+        $request->time = $this->startedAt;
+
         $request->method = $empira->method;
         $request->url = $empira->fullUrl();
         $request->uri = $empira->path();
@@ -136,6 +166,8 @@ final class EmpiraDataSource implements DataSourceInterface
         $request->responseTime = microtime(true);
         $request->responseDuration = ($request->responseTime - $this->startedAt) * 1000;
         $request->memoryUsage = memory_get_peak_usage(true);
+
+        $this->flush($request);
 
         if ($this->error !== null) {
             // On both surfaces, because they are read in different places and a
@@ -182,46 +214,105 @@ final class EmpiraDataSource implements DataSourceInterface
     }
 
     /**
+     * Put the developer's marks and messages into the profile.
+     *
+     * Runs here rather than when they are made, because the Clockwork request
+     * object does not exist until {@see Profiler::record()} calls this — see
+     * {@see Marks}.
+     *
+     * `Timeline::create()` rather than `event()`: `event()` finds-or-creates by
+     * name, so a mark inside a loop would collapse into one event and the
+     * remaining payloads would be dropped. Repeat marks are the point of them.
+     *
+     * An event with no `end` is left open deliberately — `finalize()` closes it
+     * against the request's own window, so an unfinished mark (a loop that
+     * returned early, a span nobody ended) still lands somewhere sensible rather
+     * than being discarded.
+     */
+    private function flush(ClockworkRequest $request): void
+    {
+        foreach ($this->marks->entries() as $entry) {
+            $request->log()->log($entry['level'], $entry['message'], $entry['context']);
+        }
+
+        foreach ($this->marks->events() as $event) {
+            $request->timeline()->create($event['description'], [
+                'start' => $event['start'],
+                'end' => $event['end'],
+                'color' => $event['color'],
+                'data' => $event['data'],
+            ]);
+        }
+    }
+
+    /**
      * The two events worth having whether or not a handler was reached: when the
      * request entered, and what it matched.
      *
      * Under a worker the entry time is the only way to see that a route's
      * duration was mostly spent waiting for the previous request's session lock
      * to clear, which is invisible in a per-request number.
+     *
+     * ## The payload goes under `data`
+     *
+     * `Event::__construct()` reads `$data['name']`, `['start']`, `['end']`,
+     * `['color']` and `['data']` — and nothing else. A payload passed at the top
+     * level is none of those five, so it is **silently discarded** and the event
+     * arrives with `data: null` and no sign that anything was lost. Wrapping in
+     * `['data' => …]` is the entire fix; there is no way to have it quietly not
+     * work.
+     *
+     * `event()` rather than `create()` is right here and wrong for a developer's
+     * marks: it *finds or creates* by name, so repeated marks would collapse
+     * into one event. These names are unique per request, and collapsing them
+     * would be wrong.
      */
     private function timeline(ClockworkRequest $clockwork, Request $empira): void
     {
         if ($this->startedAt > 0.0) {
             $clockwork->timeline()->event('Request received', [
-                'absolute' => $this->startedAt,
+                'start' => $this->startedAt,
                 'bootstrap' => true,
+                'data' => ['at' => $this->startedAt],
             ]);
         }
 
         $clockwork->timeline()->event('Matched', [
-            'method' => $empira->method,
-            'path' => $empira->path(),
-            'route' => $this->route?->name,
-            'client' => $empira->ip(),
+            'data' => [
+                'method' => $empira->method,
+                'path' => $empira->path(),
+                'route' => $this->route?->name,
+                'client' => $empira->ip(),
+            ],
         ]);
 
         if ($this->response !== null) {
-            $headers = $this->response->headers();
-            $contentType = '';
-
-            foreach ($headers as $name => $value) {
-                if (strcasecmp($name, 'content-type') === 0) {
-                    $contentType = $value;
-                    break;
-                }
-            }
-
             $clockwork->timeline()->event('Response sent', [
-                'status' => $this->response->status(),
-                'content-type' => $contentType,
-                'memory' => memory_get_peak_usage(true),
+                'data' => [
+                    'status' => $this->response->status(),
+                    'content-type' => $this->header($this->response, 'content-type'),
+                    'memory' => memory_get_peak_usage(true),
+                ],
             ]);
         }
+    }
+
+    /**
+     * One response header, case-insensitively.
+     *
+     * {@see Response::headers()} returns names as they were written, so
+     * `Content-Type` and `content-type` are the same header and a plain array
+     * lookup finds only one of them.
+     */
+    private function header(Response $response, string $name): string
+    {
+        foreach ($response->headers() as $header => $value) {
+            if (strcasecmp($header, $name) === 0) {
+                return $value;
+            }
+        }
+
+        return '';
     }
 
     /**
