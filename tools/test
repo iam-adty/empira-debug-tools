@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# Run the test suite.
+#
+# On the host PHP against SQLite, needing no server and no container — which is
+# the point of it being a module rather than an application.
+#
+# What this script does enforce is the part that matters for the gate — that the
+# suite **finished**. PHPUnit picks its exit status in ShellExitCodeCalculator,
+# which nothing reaches if the process exits first, so an `exit` anywhere in the
+# code under test truncates the run, prints no summary, and exits 0. Measured in
+# the framework, not assumed: a fixture with an `exit` in it stopped the suite
+# early and still reported success.
+#
+# So the summary line is what this reads, not the exit status.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if ! command -v composer > /dev/null 2>&1; then
+    echo "composer is not on PATH." >&2
+    exit 1
+fi
+
+output="$(vendor/bin/phpunit 2>&1)" || true
+
+printf '%s\n' "$output"
+
+if ! grep -qE '^(OK|Tests:|FAILURES!|ERRORS!)' <<<"$output"; then
+    echo >&2
+    echo "The suite printed no summary line, so it cannot be said to have" >&2
+    echo "finished. Treating that as a failure rather than a pass." >&2
+    exit 1
+fi
+
+if grep -qE '^(FAILURES!|ERRORS!)' <<<"$output"; then
+    exit 1
+fi

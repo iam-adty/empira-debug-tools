@@ -1,0 +1,49 @@
+{
+    "name": "iam-adty/empira-debug-tools",
+    "description": "Debug tooling for an Empira application: a Clockwork-backed request profiler, as a module.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "empira",
+        "debugging",
+        "clockwork",
+        "profiling",
+        "devtools"
+    ],
+    "require": {
+        "php": "^8.4",
+        "iam-adty/empira-principle": "dev-main",
+        "itsgoingd/clockwork": "^5.3"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Empira\\DebugTools\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Empira\\DebugTools\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "tools/test"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-main": "0.1.x-dev"
+        }
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "git@github.com:iam-adty/empira-principle.git"
+        }
+    ],
+    "//repositories": "The framework is not on Packagist, so it resolves from GitHub. Clockwork is — no repository block needed for it."
+}

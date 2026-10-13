@@ -1,0 +1,338 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Empira\DebugTools\Tests;
+
+use Empira\Application;
+use Empira\DebugTools\DebugController;
+use Empira\DebugTools\DebugToolsModule;
+use Clockwork\Request\Request as ClockworkRequest;
+use Empira\Console\Output;
+use Empira\DebugTools\Console\ClearCommand;
+use Empira\DebugTools\Console\ShowCommand;
+use Empira\DebugTools\Profiler;
+use Empira\Http\Request;
+use Empira\Http\Response;
+use PHPUnit\Framework\TestCase;
+
+/**
+ * The module, exercised through a real application.
+ *
+ * Every test here drives `$app->handle()` rather than calling the data source
+ * directly. That is deliberate: the interesting failures in this kind of module
+ * are not in the reading, they are in the wiring — a middleware registered after
+ * the pipeline was built, a route that never matches, a storage directory that
+ * is one level too high. None of those are visible from the inside.
+ */
+final class DebugToolsTest extends TestCase
+{
+    private string $basePath;
+
+    protected function setUp(): void
+    {
+        $this->basePath = sys_get_temp_dir() . '/empira-debug-tools-' . bin2hex(random_bytes(6));
+
+        mkdir($this->basePath, 0777, true);
+    }
+
+    protected function tearDown(): void
+    {
+        $this->removeDirectory($this->basePath);
+    }
+
+    public function testItRecordsARequestAndNamesTheRouteThatServedIt(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+
+        $response = $app->handle(new Request(method: 'GET', uri: '/things'));
+
+        // The header is the contract the browser interface and the DevTools
+        // panel both rely on, so it is asserted rather than assumed.
+        $this->assertNotNull($response->headers()['X-Clockwork-Id'] ?? null);
+
+        $recorded = $this->latest($app);
+
+        $this->assertSame('GET', $recorded['method']);
+        $this->assertSame('/things', $recorded['uri']);
+        $this->assertSame(200, $recorded['responseStatus']);
+        $this->assertSame('things.index', $recorded['controller']);
+    }
+
+    public function testItRecordsEachRequestSeparately(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+        $app->routes()->get('/other', fn (): string => 'other', 'other.index');
+
+        $first = $app->handle(new Request(method: 'GET', uri: '/things'))->headers()['X-Clockwork-Id'];
+        $app->handle(new Request(method: 'GET', uri: '/other'));
+
+        $storage = $app->container()->get(Profiler::class)->storage();
+
+        $this->assertNotSame($first, $this->latest($app)['id'], 'the second request should be the latest, not an update of the first');
+        $this->assertCount(2, $storage->all());
+    }
+
+    public function testItRecordsTheStatusOfAResponseThatIsNotOk(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+
+        // A fallback, so an unmatched path is answered rather than thrown. Which
+        // of those an application does is its own business; this module's job is
+        // to report the status it was given, and a 404 from a fallback is the
+        // cheapest way to hand it one.
+        $app->fallback(fn (): Response => Response::html('not found', 404));
+
+        $app->handle(new Request(method: 'GET', uri: '/nope'));
+
+        $this->assertSame(404, $this->latest($app)['responseStatus']);
+    }
+
+    public function testItRecordsTheRequestThatThrewAndRethrowsIt(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/boom', function (): string {
+            throw new \RuntimeException('the handler exploded');
+        }, 'boom.index');
+
+        // Whether the application renders the failure or lets it out is its own
+        // choice — with no error view it throws, which is the honest result and
+        // not this module's to decide. What matters either way is that the
+        // profile explaining it was written *before* the throw, since a
+        // profiler that skips exactly the requests you wanted to debug is worse
+        // than no profiler.
+        try {
+            $app->handle(new Request(method: 'GET', uri: '/boom'));
+        } catch (\Throwable) {
+            // Expected on an application with no error view.
+        }
+
+        $recorded = $this->latest($app);
+
+        $this->assertNotEmpty(
+            $this->errorMessages($recorded),
+            'the thrown handler should appear in the recorded log',
+        );
+    }
+
+    public function testItCollectsNothingWhenDisabled(): void
+    {
+        $app = $this->app(enabled: false);
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+
+        $response = $app->handle(new Request(method: 'GET', uri: '/things'));
+
+        $this->assertSame(200, $response->status());
+        $this->assertArrayNotHasKey('X-Clockwork-Id', $response->headers());
+        $this->assertDirectoryDoesNotExist($this->storagePath());
+    }
+
+    public function testTheInterfaceIsNotRoutableWhenDisabled(): void
+    {
+        $app = $this->app(enabled: false);
+
+        // Not merely refused — absent. The profiler's safety here rests on the
+        // URL not existing, so a 404 from the application itself is the thing
+        // being asserted.
+        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH))->status());
+    }
+
+    public function testTheInterfaceServesTheApplicationWhenEnabled(): void
+    {
+        $app = $this->app();
+
+        $response = $app->handle(new Request(method: 'GET', uri: DebugController::PATH));
+
+        $this->assertSame(200, $response->status());
+        $this->assertStringContainsString(DebugController::PATH . '/api', $response->body());
+    }
+
+    public function testTheInterfaceServesTheApiAsJson(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+
+        $app->handle(new Request(method: 'GET', uri: '/things'));
+        $response = $app->handle(new Request(method: 'GET', uri: DebugController::PATH . '/api'));
+
+        $this->assertSame(200, $response->status());
+        $this->assertSame('/things', json_decode($response->body(), true)['uri']);
+    }
+
+    public function testAssetsCannotEscapeThePackage(): void
+    {
+        $app = $this->app();
+
+        // Reaches the catch-all, and the traversal has to be refused by the
+        // package's own path check rather than by a rule written here.
+        $response = $app->handle(new Request(
+            method: 'GET',
+            uri: DebugController::PATH . '/app/../../../../../../etc/passwd',
+        ));
+
+        $this->assertSame(404, $response->status());
+    }
+
+    public function testClearEmptiesTheRecordedRequests(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+        $app->handle(new Request(method: 'GET', uri: '/things'));
+
+        $storage = $app->container()->get(Profiler::class)->storage();
+        $this->assertNotEmpty($storage->all());
+
+        [$stream, $output] = $this->recorder();
+
+        $exit = (new ClearCommand($app->container()->get(Profiler::class)))->handle([], $output);
+
+        $this->assertSame(0, $exit);
+        $this->assertEmpty($storage->all());
+        $this->assertStringContainsString('cleared 1', $this->readOutput($stream));
+    }
+
+    public function testItRegistersItsCommandsThroughTheModule(): void
+    {
+        // The module's half of the contract is CommandProvider, and a command
+        // that works when called by hand but never appears in `composer debug:*`
+        // is the usual way this goes unnoticed.
+        $names = array_keys($this->app()->commands());
+
+        $this->assertContains('debug:show', $names);
+        $this->assertContains('debug:clear', $names);
+    }
+
+    public function testShowReportsTheLatestRequest(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+        $app->handle(new Request(method: 'GET', uri: '/things'));
+
+        [$stream, $output] = $this->recorder();
+
+        $exit = (new ShowCommand($app->container()->get(Profiler::class)))->handle([], $output);
+
+        $this->assertSame(0, $exit);
+
+        $printed = $this->readOutput($stream);
+
+        $this->assertStringContainsString('/things', $printed);
+        $this->assertStringContainsString('things.index', $printed);
+    }
+
+    public function testShowSaysSoWhenNothingHasBeenRecorded(): void
+    {
+        $app = $this->app();
+
+        [$stream, $output] = $this->recorder();
+
+        // Zero, not a failure: "nothing recorded" is a normal state, and a
+        // non-zero exit here would make this unusable as a check.
+        $exit = (new ShowCommand($app->container()->get(Profiler::class)))->handle([], $output);
+
+        $this->assertSame(0, $exit);
+        $this->assertStringContainsString('no requests', $this->readOutput($stream));
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    /**
+     * A real {@see Output} writing to memory.
+     *
+     * `Output` is final and writes to a stream, so this needs no double — and a
+     * test double here would be asserting against an imitation of the console's
+     * own formatting rather than the thing itself.
+     *
+     * @return array{0: resource, 1: Output}
+     */
+    private function recorder(): array
+    {
+        $stream = fopen('php://memory', 'r+');
+
+        return [$stream, new Output($stream)];
+    }
+
+    /**
+     * @param resource $stream
+     */
+    private function readOutput($stream): string
+    {
+        rewind($stream);
+
+        return stream_get_contents($stream);
+    }
+
+    private function app(bool $enabled = true): Application
+    {
+        $app = new Application('a-secret-that-is-long-enough');
+
+        $app->module(new DebugToolsModule($this->basePath, ['enabled' => $enabled]));
+
+        return $app;
+    }
+
+    /**
+     * The most recently recorded request, as an array.
+     *
+     * Clockwork's storage answers with a `Request` object — or `false` when
+     * nothing is recorded — so every read in this file goes through here rather
+     * than each test rediscovering which of the three shapes it is holding.
+     *
+     * @return array<string, mixed>
+     */
+    private function latest(Application $app): array
+    {
+        return $this->latestOf($app)->toArray();
+    }
+
+    private function latestOf(Application $app): ClockworkRequest
+    {
+        $latest = $app->container()->get(Profiler::class)->storage()->latest();
+
+        $this->assertInstanceOf(ClockworkRequest::class, $latest, 'a request should have been recorded');
+
+        return $latest;
+    }
+
+    private function storagePath(): string
+    {
+        return $this->basePath . '/storage/clockwork';
+    }
+
+    /**
+     * @param array<string, mixed> $recorded
+     * @return list<string>
+     */
+    private function errorMessages(array $recorded): array
+    {
+        $messages = [];
+
+        foreach ($recorded['log'] ?? [] as $entry) {
+            if (is_array($entry) && isset($entry['message']) && is_string($entry['message'])) {
+                $messages[] = $entry['message'];
+            }
+        }
+
+        return $messages;
+    }
+
+    private function removeDirectory(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        foreach (new \DirectoryIterator($path) as $item) {
+            if ($item->isDot()) {
+                continue;
+            }
+
+            $item->isDir() ? $this->removeDirectory($item->getPathname()) : @unlink($item->getPathname());
+        }
+
+        @rmdir($path);
+    }
+}

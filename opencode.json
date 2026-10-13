@@ -1,0 +1,12 @@
+{
+    "$schema": "https://opencode.ai/config.json",
+    "//instructions": "Relative to this file's directory, which is the package root. The agent guidance lives in the sibling dev/ repository rather than here, so that one set of rules covers all five repositories and cannot drift between them. README.md stays here because it is the package's front page on Packagist and ships to consumers.",
+    "instructions": [
+        "../dev/agents/debugtools.md",
+        "README.md"
+    ],
+    "//skills": "`skills.paths` rather than a `.opencode/` directory or a symlink, because this is a git worktree and OpenCode stops walking up at one. A directory under it is invisible to a session started anywhere in this package; a path in this file is not. It points at the sibling dev/ repository, which is where the skills actually live.",
+    "skills": {
+        "paths": ["../dev/.opencode/skills"]
+    }
+}
