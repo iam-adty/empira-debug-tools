@@ -269,15 +269,29 @@ final class EmpiraDataSource implements DataSourceInterface
      */
     private function timeline(ClockworkRequest $clockwork, Request $empira): void
     {
-        if ($this->startedAt > 0.0) {
-            $clockwork->timeline()->event('Request received', [
-                'start' => $this->startedAt,
-                'bootstrap' => true,
-                'data' => ['at' => $this->startedAt],
-            ]);
-        }
+        // ## Every one of these sets `end` as well as `start`
+        //
+        // An event with a `start` and no `end` has the missing end filled in by
+        // `Event::finalize()` with "now", and the missing start with the request's
+        // own start time — so it claims to have spanned the entire request. Three
+        // events all reading `6.224ms` and all meaning something different is
+        // worse than no timeline: "Matched" did not take six milliseconds, it
+        // happened.
+        //
+        // They are point events, and are shaped like point events.
+        $received = $this->startedAt;
+        $matched = microtime(true);
+
+        $clockwork->timeline()->event('Request received', [
+            'start' => $received,
+            'end' => $received,
+            'bootstrap' => true,
+            'data' => ['at' => $received],
+        ]);
 
         $clockwork->timeline()->event('Matched', [
+            'start' => $matched,
+            'end' => $matched,
             'data' => [
                 'method' => $empira->method,
                 'path' => $empira->path(),
@@ -287,7 +301,11 @@ final class EmpiraDataSource implements DataSourceInterface
         ]);
 
         if ($this->response !== null) {
+            $sent = microtime(true);
+
             $clockwork->timeline()->event('Response sent', [
+                'start' => $sent,
+                'end' => $sent,
                 'data' => [
                     'status' => $this->response->status(),
                     'content-type' => $this->header($this->response, 'content-type'),

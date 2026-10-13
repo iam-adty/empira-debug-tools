@@ -214,6 +214,39 @@ final class StorageHistoryTest extends TestCase
         $this->assertSame(404, $response->status());
     }
 
+    /**
+     * The lifecycle events are points in time, not spans.
+     *
+     * An event with a `start` and no `end` gets the missing end filled in by
+     * `Event::finalize()` with "now", so it claims to have spanned the whole
+     * request. Three events all reading the same duration — and "Matched" is not
+     * something that takes six milliseconds — is a timeline that misinforms
+     * rather than one that is merely uninformative.
+     */
+    public function testLifecycleEventsArePointsRatherThanWholeRequestSpans(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/points', function (): string {
+            usleep(2000);
+
+            return 'ok';
+        }, 'points.index');
+
+        $app->handle(new Request(method: 'GET', uri: '/points'));
+
+        $recorded = $this->latest($app);
+
+        $this->assertGreaterThan(1.5, $recorded['responseDuration'], 'the request itself took ~2ms');
+
+        foreach ($recorded['timelineData'] as $event) {
+            $this->assertLessThan(
+                0.5,
+                $event['duration'],
+                sprintf('"%s" claims %.2fms, which is the whole request', $event['description'], $event['duration']),
+            );
+        }
+    }
+
     public function testTheDataIsNotServedWhenTheModuleIsOff(): void
     {
         $app = $this->app(enabled: false);
