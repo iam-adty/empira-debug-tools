@@ -181,9 +181,19 @@ final class Profiler
         }
     }
 
-    private function environment(): string
+    /**
+     * The environment name, as the rest of the workspace reads it.
+ *
+ * `$_ENV` first because that is what every other package here reads — the
+ * framework's own configuration, the skeleton's logging setup — and a profiler
+ * that disagreed with the application about which environment it is running in
+ * would be deciding to record against a different answer than everything else
+ * already gave. `getenv()` second, for a process variable that arrived without
+ * populating the superglobal.
+ */
+private function environment(): string
     {
-        $env = $this->config['environment'] ?? getenv('APP_ENV');
+        $env = $this->config['environment'] ?? $_ENV['APP_ENV'] ?? getenv('APP_ENV');
 
         return is_string($env) ? strtolower($env) : 'production';
     }

@@ -104,7 +104,7 @@ final class DebugToolsModule implements Module, CommandProvider
             return (bool) $this->config['enabled'];
         }
 
-        $env = $this->config['environment'] ?? getenv('APP_ENV');
+        $env = $this->config['environment'] ?? $_ENV['APP_ENV'] ?? getenv('APP_ENV');
 
         return in_array(
             is_string($env) ? strtolower($env) : 'production',
