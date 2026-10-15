@@ -17,7 +17,16 @@ use Empira\Http\Response;
  * `/__clockwork/{id}`, `/__clockwork/latest`, `/__clockwork/{id}/previous/5` is
  * what Clockwork's Slim and Laravel integrations expose, and what its clients
  * expect — the Chrome extension reads `X-Clockwork-Path` and appends an id to it.
- * The same family is reproduced under {@see PATH} so the prefix can be ours.
+ * **The prefix is upstream's, not a choice this package made.** It used to be
+ * `/_clockwork` with an `/api` segment Clockwork does not have, on the reasoning
+ * that the family was reproduced under our own prefix. That only ever worked for
+ * a client that honoured the header: Clockwork's own JavaScript takes
+ * `X-Clockwork-Path` as an *override* and otherwise constructs `/__clockwork/…`
+ * itself, which 404'd. Matching upstream exactly means a client that reads the
+ * header and one that ignores it resolve to the same place.
+ *
+ * The `{id}` constraint is load-bearing rather than decorative — see the note on
+ * {@see PATH} for why `/app/` has to stay reachable through the asset route.
  *
  * ## Nothing is injected into a page
  *
@@ -43,17 +52,15 @@ final class DebugController
      * Nothing checks a token before answering. That is the design: the route
      * either exists or it does not, and it does not exist unless the environment
      * said to publish it, so there is no authorisation to forget.
-     */
-    public const PATH = '/_clockwork';
-
-    /**
-     * Where the recorded data is served, and what `X-Clockwork-Path` advertises.
      *
-     * Public because the middleware writes it into that header, and it is
-     * exactly the value a client appends an id to — so it is not an internal
-     * detail that can drift from the route table.
+     * This is Clockwork's own prefix, not one of ours. It used to be `/_clockwork`
+     * with an `/api` segment the upstream has never had, which worked only for a
+     * client that reads `X-Clockwork-Path`; the shipped JavaScript falls back to
+     * constructing `/__clockwork/…` itself when that header is absent, and
+     * 404'd. Matching upstream exactly means both paths land in the same place,
+     * and it is the prefix a reader debugging a URL will recognise.
      */
-    public const API = self::PATH . '/api';
+    public const PATH = '/__clockwork';
 
     public function __construct(
         private readonly Profiler $profiler,

@@ -75,16 +75,19 @@ final class DebugToolsModule implements Module, CommandProvider
         $controller = new DebugController($container->get(Profiler::class));
         $routes = $app->routes();
 
-        // Registration order is matching order, so the API is declared before the
-        // catch-all asset route: a path beginning `api/` is answered as data even
-        // though it would also satisfy `{path:.*}`.
+        // Registration order is matching order, and the asset route is a catch-all,
+        // so the id routes come first. The `[0-9-]+|latest` constraint is what
+        // makes that safe rather than merely conventional: without it
+        // `/app/dashboard.js` matches `{id}` with `id = app` and the asset route is
+        // never reached. It is also Clockwork's own shape — its Slim middleware uses
+        // `([0-9-]+|latest)`.
         //
         // There is no HTML page here. Nothing is injected into an application's
-        // responses and this package ships no JavaScript — a Clockwork client
-        // reads the `X-Clockwork-*` headers and fetches the JSON from below.
-        $routes->get(DebugController::API, [$controller, 'api'], 'debug.api', csrf: false);
-        $routes->get(DebugController::API . '/{id}', [$controller, 'api'], 'debug.api.show', csrf: false);
-        $routes->get(DebugController::API . '/{id}/{direction}/{count}', [$controller, 'api'], 'debug.api.page', csrf: false);
+        // responses and this package ships no JavaScript — a Clockwork client reads
+        // the `X-Clockwork-*` headers and fetches `{PATH}/{id}` from below.
+        $routes->get(DebugController::PATH, [$controller, 'api'], 'debug.api', csrf: false);
+        $routes->get(DebugController::PATH . '/{id:[0-9-]+|latest}', [$controller, 'api'], 'debug.api.show', csrf: false);
+        $routes->get(DebugController::PATH . '/{id:[0-9-]+|latest}/{direction}/{count}', [$controller, 'api'], 'debug.api.page', csrf: false);
         $routes->get(DebugController::PATH . '/app/{path:.*}', [$controller, 'asset'], 'debug.asset', csrf: false);
     }
 

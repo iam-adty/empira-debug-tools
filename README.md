@@ -60,7 +60,7 @@ returns a `Server-Timing` header, so a browser's network panel shows the
 duration without the profiler being opened, and an `X-Clockwork-Id` header
 naming the stored profile.
 
-The interface is at `/_clockwork`, and it is Clockwork's own — the part worth
+The interface is at `/__clockwork`, and it is Clockwork's own — the part worth
 looking at is the timeline and the request/response detail.
 
 ## Reading a profile
@@ -73,12 +73,19 @@ off each response and fetches the data itself:
 |---|---|
 | `X-Clockwork-Id` | the id this request was stored under |
 | `X-Clockwork-Version` | the Clockwork version that stored it |
-| `X-Clockwork-Path` | the API base to fetch from — **not** the URL prefix |
+| `X-Clockwork-Path` | the base to fetch from — `/__clockwork` |
 
 A client appends the id to that path, so the data lives at
-`/_clockwork/api/{id}`, and `/_clockwork/api/latest`, and
-`/_clockwork/api/{id}/previous/5`. Those are the URLs, not decoration: a
+`/__clockwork/{id}`, and `/__clockwork/latest`, and
+`/__clockwork/{id}/previous/5`. Those are the URLs, not decoration: a
 `debug:clear` empties them and nothing else.
+
+The header is worth a note, because it is the part that is easy to get wrong. It
+is the **base the data hangs off**, and a client appends an id to it — not the
+prefix some other interface is mounted at. Here the two happen to be the same
+string, and deliberately so: Clockwork's shipped JavaScript treats the header as
+an *override* and otherwise constructs `/__clockwork/…` itself. Publishing our
+own prefix would mean one of the two paths 404s, depending on the client.
 
 **This package ships no JavaScript and injects nothing into your pages.** That is
 upstream's position too — Clockwork's own in-page toolbar is a separate npm or

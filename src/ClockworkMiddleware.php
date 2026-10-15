@@ -95,11 +95,10 @@ final class ClockworkMiddleware implements Middleware
      * This is the whole integration with the Chrome extension, and
      * `X-Clockwork-Path` is the part that is easy to get wrong. A client parses
      * these three headers for `{id, path, version}` and then asks for
-     * `{path}/{id}` — Clockwork's own value for `path` is `/__clockwork/`, and its
-     * server answers `/__clockwork/{id}`. So the header is the **API base**, not
-     * the prefix the interface is mounted at, and sending {@see
-     * DebugController::PATH} would point every client at a route that does not
-     * exist.
+     * `{path}/{id}` — and the path is the **base the data hangs off**, not the
+     * prefix the interface is mounted at. That is now {@see DebugController::PATH},
+     * which is Clockwork's own prefix, so a client that reads this header and one
+     * that falls back to constructing `/__clockwork/…` itself reach the same URL.
      *
      * `Server-Timing` is the one that pays for itself: browsers surface it in
      * the network panel for every page load, so the profiler is visible without
@@ -114,7 +113,7 @@ final class ClockworkMiddleware implements Middleware
         return $response
             ->withHeader('X-Clockwork-Id', $id)
             ->withHeader('X-Clockwork-Version', \Clockwork\Clockwork::VERSION)
-            ->withHeader('X-Clockwork-Path', DebugController::API)
+            ->withHeader('X-Clockwork-Path', DebugController::PATH)
             ->withHeader(
                 'Server-Timing',
                 ServerTiming::fromRequest($this->profiler->clockwork()->request())->value(),

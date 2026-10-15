@@ -144,8 +144,11 @@ final class DebugToolsTest extends TestCase
     {
         // Nothing here serves a page, and that is the point: the package ships no
         // JavaScript and puts nothing into an application's responses. A Clockwork
-        // client is a browser extension reading headers, not markup in your page,
-        // so `/_clockwork` itself is not a route.
+        // client is a browser extension reading headers, not markup in your page.
+        //
+        // `/{__clockwork}/{id}` *is* a route, which is the other half of why this
+        // assertion holds: the prefix alone resolves to the latest recorded
+        // request, so there is no HTML to serve there.
         $app = $this->app();
 
         $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH))->status());
@@ -170,7 +173,10 @@ final class DebugToolsTest extends TestCase
         $app->routes()->get('/things', fn (): string => 'things', 'things.index');
 
         $app->handle(new Request(method: 'GET', uri: '/things'));
-        $response = $app->handle(new Request(method: 'GET', uri: DebugController::PATH . '/api'));
+
+        // The bare prefix, with no id — the shape a client reaches when it has an
+        // `X-Clockwork-Id` but wants the latest rather than a specific request.
+        $response = $app->handle(new Request(method: 'GET', uri: DebugController::PATH));
 
         $this->assertSame(200, $response->status());
         $this->assertSame('/things', json_decode($response->body(), true)['uri']);
@@ -188,6 +194,29 @@ final class DebugToolsTest extends TestCase
         ));
 
         $this->assertSame(404, $response->status());
+    }
+
+    public function testAnAssetPathIsNotSwallowedByTheIdRoute(): void
+    {
+        $app = $this->app();
+
+        // Dropping the `/api` segment put `app/` within the `{id}` route's reach,
+        // so this is the one path that must still fall through to the asset
+        // handler. If the constraint were dropped, `{id}` would take `app` and
+        // answer JSON — the status alone would not catch it, because an unknown
+        // id 404s too, so the content type is what distinguishes the two.
+        $response = $app->handle(new Request(
+            method: 'GET',
+            uri: DebugController::PATH . '/app/assets/index-159S-Gz-.js',
+        ));
+
+        $this->assertSame(200, $response->status());
+
+        $headers = $response->headers();
+        $type = strtolower((string) ($headers['Content-Type'] ?? $headers['content-type'] ?? ''));
+
+        $this->assertStringContainsString('javascript', $type, 'served by the asset handler, not the id route');
+        $this->assertNotSame('', trim($response->body()), 'the asset body was served, not an error page');
     }
 
     public function testClearEmptiesTheRecordedRequests(): void

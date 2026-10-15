@@ -62,7 +62,7 @@ final class StorageHistoryTest extends TestCase
 
         $url = $headers['x-clockwork-path'] . '/' . $headers['x-clockwork-id'];
 
-        // Built from the header, not from DebugController::API — if the header
+        // Built from the header, not from the constant — if the header
         // were wrong the two would disagree and this request would 404.
         $fetched = $app->handle(new Request(method: 'GET', uri: $url));
 
@@ -76,17 +76,30 @@ final class StorageHistoryTest extends TestCase
         $this->assertSame($headers['x-clockwork-id'], $data['id']);
     }
 
-    public function testThePathHeaderNamesTheApiBaseRatherThanThePrefix(): void
+    public function testThePathHeaderIsTheBaseAClientAppendsAnIdTo(): void
     {
         $app = $this->app();
         $app->routes()->get('/things', fn (): string => 'things');
 
         $path = $this->headerMap($app->handle(new Request(method: 'GET', uri: '/things')))['x-clockwork-path'];
 
-        // The prefix itself is not the API base, and saying so here is the
-        // difference between a documented trap and one rediscovered by a 404.
-        $this->assertNotSame(DebugController::PATH, $path);
-        $this->assertSame(DebugController::API, $path);
+        // Clockwork's own prefix, and the base the data hangs off: `{path}/{id}`
+        // is a real route. This used to assert the *opposite* — that the header
+        // was `/_clockwork/api` and therefore NOT the prefix — because this
+        // package carried an `/api` segment upstream does not have. Clockwork's
+        // JavaScript treats the header as an override and otherwise constructs
+        // `/__clockwork/…` itself, so anything else meant one of the two paths
+        // 404'd.
+        $this->assertSame('/__clockwork', $path);
+        $this->assertSame(DebugController::PATH, $path);
+
+        $id = $this->headerMap($app->handle(new Request(method: 'GET', uri: '/things')))['x-clockwork-id'];
+
+        $this->assertSame(
+            200,
+            $app->handle(new Request(method: 'GET', uri: $path . '/' . $id))->status(),
+            'the base the header advertises must resolve with an id appended',
+        );
     }
 
     public function testHistoryGrowsByOnePerRequestAndReadsOldestFirst(): void
@@ -179,12 +192,12 @@ final class StorageHistoryTest extends TestCase
 
         $one = json_decode($app->handle(new Request(
             method: 'GET',
-            uri: DebugController::API . '/' . $id,
+            uri: DebugController::PATH . '/' . $id,
         ))->body(), true);
 
         $page = json_decode($app->handle(new Request(
             method: 'GET',
-            uri: sprintf('%s/%s/previous/5', DebugController::API, $id),
+            uri: sprintf('%s/%s/previous/5', DebugController::PATH, $id),
         ))->body(), true);
 
         $this->assertIsArray($page);
@@ -207,7 +220,10 @@ final class StorageHistoryTest extends TestCase
         $app->routes()->get('/real', fn (): string => 'ok');
         $app->handle(new Request(method: 'GET', uri: '/real'));
 
-        $response = $app->handle(new Request(method: 'GET', uri: DebugController::API . '/no-such-request'));
+        // A well-formed id that was never recorded. It has to satisfy the route's
+        // `{id:[0-9-]+|latest}` constraint, or the request 404s at *routing* and
+        // this would pass without ever reaching the storage it is testing.
+        $response = $app->handle(new Request(method: 'GET', uri: DebugController::PATH . '/1792052326-7296-1076861104'));
 
         // `find()` answers `false`, and an empty history answers `[]`. A 200 with
         // `null` lets a client cache "no such request" as though it were data.
@@ -251,7 +267,7 @@ final class StorageHistoryTest extends TestCase
     {
         $app = $this->app(enabled: false);
 
-        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::API))->status());
+        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH))->status());
         $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH . '/app/index.html'))->status());
     }
 
