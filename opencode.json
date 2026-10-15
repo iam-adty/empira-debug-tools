@@ -5,8 +5,6 @@
         "../dev/agents/debugtools.md",
         "README.md"
     ],
-    "//skills": "`skills.paths` rather than a `.opencode/` directory or a symlink, because this is a git worktree and OpenCode stops walking up at one. A directory under it is invisible to a session started anywhere in this package; a path in this file is not. It points at the sibling dev/ repository, which is where the skills actually live.",
-    "skills": {
-        "paths": ["../dev/.opencode/skills"]
-    }
+    "//skills": "A plain array rather than the V1 `skills.paths` object, which V1 and V2 separate into two keys and V2 combines into one ordered array. A `paths` entry rather than a `.opencode/` directory or a symlink, because this is a git worktree and OpenCode stops walking up at one. A directory under it is invisible to a session started anywhere in this package; a path in this file is not. It points at the sibling dev/ repository, which is where the skills actually live.",
+    "skills": ["../dev/.opencode/skills"]
 }
