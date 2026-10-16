@@ -7,28 +7,36 @@ namespace Empira\DebugTools;
 /**
  * What a developer said about the request currently being handled.
  *
- * ## Why this exists rather than writing straight to Clockwork
+ * ## Why this exists rather than writing straight to the collector
  *
- * The Clockwork `Request` object does not exist while the handler runs — it is
- * built in `Profiler::record()`, afterwards. So a mark made at the interesting
- * line has to be held somewhere until then, which is this.
+ * DebugBar's `TimeDataCollector` is available for the whole request, so a mark
+ * *could* be added to it the moment it is made. This exists because two things
+ * that work here have no equivalent there:
  *
- * Buffered, not lost: a mark is dropped only because the request ended before
- * `resolve()` could drain it, which never happens on the paths that exist.
+ * - **A span can be updated while it is open.** `update()` merges data into a
+ *   running span, which is how `rows: 200` becomes `rows: 2000` as an import
+ *   proceeds. `addMeasure()` is append-only, so a collector cannot be corrected
+ *   after the fact.
+ * - **A span can be read back.** {@see Span::duration()} answers "how long has
+ *   this taken so far" by looking at the stored event, which a collector's
+ *   write-only API cannot provide.
+ *
+ * So this is a buffer, drained into the collector when the request is stored, and
+ * not a vestige of the previous profiler.
  *
  * ## Two kinds of thing, kept apart
  *
  * **Events** are points on a timeline — "cache miss", "import started". **Log
  * entries** are messages with a level — "falling back to the old parser".
- * Clockwork keeps them in separate structures and shows them separately, so they
+ * DebugBar keeps them in separate collectors and shows them separately, so they
  * stay separate here too.
  *
  * ## Cleared per request, not per object
  *
  * One instance serves every request a process handles, because there is one
- * {@see Profiler} and therefore one Clockwork instance. {@see reset()} runs in
+ * {@see Profiler} and therefore one DebugBar instance. {@see reset()} runs in
  * `Profiler::record()`'s `finally`, so a mark can never survive into the next
- * request — under a worker that would be one request explaining another.
+ * request — that would be one request explaining another.
  *
  * @see Debug for the developer-facing API.
  */

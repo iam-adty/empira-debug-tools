@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Empira\DebugTools;
 
-use Clockwork\Request\LogLevel;
+use Psr\Log\LogLevel;
 
 /**
  * Say something about the request you are in the middle of.
@@ -38,8 +38,8 @@ use Clockwork\Request\LogLevel;
  * They are drained into the profile when the request is being stored. A mark
  * from a shutdown function or a destructed after the response is over is
  * discarded. Console commands are not profiled at all, so marks there are also
- * discarded — Clockwork can profile commands via `resolveAsCommand()` and this
- * module does not do that yet.
+ * discarded — the toolbar's data comes from the request pipeline, and a command
+ * has no response to be a page.
  *
  * @see Marks for what the calls actually accumulate.
  * @see Span for timing something a closure cannot wrap.
@@ -91,8 +91,10 @@ final class Debug
      * inside a loop produces a mark per iteration rather than one.
      *
      * @param array<array-key, mixed> $data shown alongside the event
-     * @param string|null $color one of Clockwork's colours: blue, green, red,
-     *                           yellow, purple, cyan
+     * @param string|null $color kept for compatibility and carried through to the
+     *                           measure's parameters. DebugBar draws its timeline
+     *                           without per-measure colours, so this reaches the
+     *                           panel as data rather than as a swatch on the bar.
      */
     public static function mark(string $description, array $data = [], ?string $color = null): void
     {

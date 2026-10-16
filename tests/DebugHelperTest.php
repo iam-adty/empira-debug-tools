@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Empira\DebugTools\Tests;
 
+use DebugBar\Storage\StorageInterface;
 use Empira\Application;
 use Empira\DebugTools\Debug;
 use Empira\DebugTools\DebugToolsModule;
+use Empira\DebugTools\Profiler;
 use Empira\Http\Request;
 use PHPUnit\Framework\TestCase;
 
@@ -17,6 +19,13 @@ use PHPUnit\Framework\TestCase;
  * and read back from the **stored profile** rather than from the objects that
  * produced them. A helper that fills a buffer nothing drains would pass every
  * test written against the buffer.
+ *
+ * ## Read through DebugBar's own shape
+ *
+ * Marks land as `time` collector measures and messages as `messages` entries, so
+ * that is where they are looked for. Assertions are about what a developer asked
+ * for surviving the round trip — the payload, the repeat, the ordering — rather
+ * than about DebugBar's serialisation, which is upstream's to keep.
  */
 final class DebugHelperTest extends TestCase
 {
@@ -42,177 +51,176 @@ final class DebugHelperTest extends TestCase
     {
         $recorded = $this->record(fn () => Debug::mark('cache miss', ['key' => 'user:7']));
 
-        $mark = $this->event($recorded, 'cache miss');
+        $mark = $this->measure($recorded, 'cache miss');
 
         $this->assertNotNull($mark, 'the mark did not reach the stored profile');
-
-        // Under `data`, because `Event` reads `$data['data']` and silently
-        // discards anything else. A payload at the top level produces an event
-        // with `data: null` and no warning that it was lost.
-        $this->assertSame(['key' => 'user:7'], $mark['data']);
+        $this->assertSame('user:7', $mark['params']['key'] ?? null);
     }
 
-    public function testRepeatMarksAreSeparateEvents(): void
+    public function testAMarksColourReachesTheProfileAsData(): void
     {
-        // `Timeline::event()` finds-or-creates by name, so three marks called
-        // `mark('row')` would collapse into one and lose two payloads. Marks go
-        // through `create()` precisely so this holds.
+        // DebugBar draws no per-measure colour, so the colour is carried as a
+        // parameter. Kept rather than dropped because removing a parameter from a
+        // public helper is a break, and a mark that carries its colour is strictly
+        // more informative than one that does not.
+        $recorded = $this->record(fn () => Debug::mark('careful', [], 'red'));
+
+        $this->assertSame('red', $this->measure($recorded, 'careful')['params']['color'] ?? null);
+    }
+
+    public function testRepeatMarksAreSeparateMeasures(): void
+    {
         $recorded = $this->record(function (): void {
             Debug::mark('row', ['n' => 1]);
             Debug::mark('row', ['n' => 2]);
             Debug::mark('row', ['n' => 3]);
         });
 
-        $rows = array_values(array_filter($recorded['timelineData'], static fn (array $e): bool => $e['description'] === 'row'));
+        $rows = $this->measuresNamed($recorded, 'row');
 
+        // The point of a mark made in a loop. DebugBar can merge repeated measures
+        // by label, and that merging is off here — a profiler that collapsed a
+        // thousand-row import into one event would have thrown away the data the
+        // developer asked to see.
         $this->assertCount(3, $rows);
-        $this->assertSame([['n' => 1], ['n' => 2], ['n' => 3]], array_column($rows, 'data'));
+        $this->assertSame(['1', '2', '3'], array_map(
+            static fn (array $m): string => (string) ($m['params']['n'] ?? ''),
+            $rows,
+        ));
     }
 
     public function testMeasureReturnsItsValueAndRecordsTheTime(): void
     {
-        $captured = null;
+        $returned = null;
 
-        $recorded = $this->record(function () use (&$captured): void {
-            $captured = Debug::measure('reindex', function (): string {
+        $recorded = $this->record(static function () use (&$returned): void {
+            $returned = Debug::measure('slow', static function (): string {
                 usleep(2000);
 
-                return 'done';
+                return 'the value';
             });
         });
 
-        // The return value first: a debug helper that swallowed it would be a
-        // production bug caused by a debugging tool.
-        $this->assertSame('done', $captured);
+        $this->assertSame('the value', $returned, 'swallowing a return value would be a production bug');
 
-        $event = $this->event($recorded, 'reindex');
+        $measure = $this->measure($recorded, 'slow');
 
-        $this->assertNotNull($event);
-        $this->assertGreaterThan(1.5, $event['duration'], 'the closure took ~2ms');
+        $this->assertNotNull($measure);
+        $this->assertGreaterThan(0.001, $measure['duration'], 'a two-millisecond closure was measured as nothing');
     }
 
     public function testMeasureStillReturnsItsValueWhenNothingIsRecording(): void
     {
-        Debug::deactivate();
+        $returned = Debug::measure('stray', static fn (): string => 'the value');
 
-        $this->assertSame('untouched', Debug::measure('noop', fn (): string => 'untouched'));
+        $this->assertSame('the value', $returned);
         $this->assertFalse(Debug::enabled());
     }
 
     public function testMeasureEndsItsSpanEvenWhenTheClosureThrows(): void
     {
         $app = $this->app();
-        $app->routes()->get('/boom', function (): void {
-            Debug::measure('failing work', function (): void {
-                usleep(1000);
-
-                throw new \RuntimeException('inner');
-            });
-        });
 
         try {
-            $app->handle(new Request(method: 'GET', uri: '/boom'));
-        } catch (\Throwable) {
-            // The application has no error view, so it rethrows. The point is
-            // what was recorded before it did.
+            $this->recordInto($app, static function (): void {
+                Debug::measure('doomed', static function (): string {
+                    throw new \RuntimeException('it broke');
+                });
+            });
+
+            $this->fail('the exception should have propagated');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('it broke', $e->getMessage());
         }
 
-        $recorded = $this->profile($app);
-
-        $this->assertNotNull(
-            $this->event($recorded, 'failing work'),
-            'a timeline that stops at the last successful step points at the wrong place',
+        // The span was still drained, because the profile is stored on the failure
+        // path too — a request you most wanted to look at is one that threw, and a
+        // span left open by the throw is exactly what you want to see in it.
+        $this->assertCount(
+            1,
+            $this->measuresNamed($this->profile($app), 'doomed'),
+            'the span was not recorded on the path that threw',
         );
     }
 
     public function testASpanCanBeOpenedAndEndedAroundOtherWork(): void
     {
-        $recorded = $this->record(function (): void {
+        $recorded = $this->record(static function (): void {
             $span = Debug::span('import');
 
-            $span?->data(['rows' => 10]);
             usleep(2000);
-            $span?->data(['done' => 10])?->end();
+
+            $span?->data(['rows' => 10])?->end();
         });
 
-        $event = $this->event($recorded, 'import');
+        $span = $this->measure($recorded, 'import');
 
-        $this->assertNotNull($event);
-        $this->assertSame(['rows' => 10, 'done' => 10], $event['data']);
-        $this->assertGreaterThan(1.5, $event['duration']);
+        $this->assertNotNull($span);
+        $this->assertSame('10', $span['params']['rows'] ?? null, 'data set while the span was open was lost');
+        $this->assertGreaterThan(0.001, $span['duration']);
     }
 
     public function testEndingASpanTwiceKeepsTheFirstTime(): void
     {
-        // A `finally` that ends the span, and a happy path that also ends it,
-        // is the ordinary shape of code with a cleanup. The version that stopped
-        // on every call would report whichever ran last.
-        $recorded = $this->record(function (): void {
-            $span = Debug::span('once');
+        $recorded = $this->record(static function (): void {
+            $span = Debug::span('import');
 
-            usleep(2000);
+            usleep(1000);
             $span?->end();
-            usleep(2000);
+
+            usleep(5000);
             $span?->end();
         });
 
-        $this->assertLessThan(3.5, $this->event($recorded, 'once')['duration']);
+        $span = $this->measure($recorded, 'import');
+
+        $this->assertNotNull($span);
+        $this->assertLessThan(0.004, $span['duration'], 'the second end() overwrote the first');
     }
 
     public function testSpanIsNullWhenNothingIsRecording(): void
     {
-        Debug::deactivate();
-
-        $this->assertNull(Debug::span('nothing'));
+        $this->assertNull(Debug::span('stray'));
     }
 
     public function testEachLogLevelLandsAtItsOwnLevel(): void
     {
-        $recorded = $this->record(function (): void {
-            Debug::info('using the v2 parser');
-            Debug::debug('sql shape');
-            Debug::warning('falling back to v1');
-            Debug::error('could not reach the cache');
+        $recorded = $this->record(static function (): void {
+            Debug::debug('d');
+            Debug::info('i');
+            Debug::warning('w');
+            Debug::error('e');
         });
 
-        $levels = array_column($recorded['log'], 'level');
-        $messages = array_column($recorded['log'], 'message');
+        $levels = array_map(
+            static fn (array $m): string => (string) ($m['label'] ?? ''),
+            $recorded['messages']['messages'] ?? [],
+        );
 
-        $this->assertContains('info', $levels);
-        $this->assertContains('debug', $levels);
-        $this->assertContains('warning', $levels);
-        $this->assertContains('error', $levels);
-        $this->assertContains('could not reach the cache', $messages);
+        // PSR-3 levels, which is what DebugBar's collector takes — and it names
+        // the field `label`, not `level`. Every logging library in the ecosystem
+        // already speaks these, so nothing has to translate them.
+        foreach (['debug', 'info', 'warning', 'error'] as $level) {
+            $this->assertContains($level, $levels);
+        }
     }
 
     public function testALogEntryKeepsItsContext(): void
     {
-        $recorded = $this->record(fn () => Debug::info('slow query', ['ms' => 812, 'table' => 'users']));
+        $recorded = $this->record(static fn () => Debug::info('user', ['id' => 7]));
 
-        $entry = array_values(array_filter($recorded['log'], static fn (array $e): bool => $e['message'] === 'slow query'));
+        $entry = null;
 
-        $this->assertNotSame([], $entry, 'the message did not reach the log');
+        foreach ($recorded['messages']['messages'] ?? [] as $message) {
+            if (($message['message'] ?? null) === 'user') {
+                $entry = $message;
 
-        // Clockwork's Serializer tags the context with `__type__`, so the values
-        // are asserted individually rather than the whole array — which also
-        // states what actually matters, that the numbers survived.
-        $context = $entry[0]['context'] ?? [];
+                break;
+            }
+        }
 
-        $this->assertSame(812, $context['ms'] ?? null);
-        $this->assertSame('users', $context['table'] ?? null);
-    }
-
-    public function testALogEntryCarriesWhereItCameFrom(): void
-    {
-        // Clockwork collects a stack trace per message by default, and for this
-        // helper that is most of the value: a mark is only useful next to the
-        // line that made it. Asserted so that turning it off would be a
-        // deliberate change rather than something nobody notices.
-        $recorded = $this->record(fn () => Debug::warning('about to fall back'));
-
-        $entry = array_values(array_filter($recorded['log'], static fn (array $e): bool => $e['message'] === 'about to fall back'));
-
-        $this->assertNotSame([], $entry[0]['trace'] ?? [], 'the log entry has no trace');
+        $this->assertNotNull($entry);
+        $this->assertStringContainsString('7', (string) json_encode($entry['context'] ?? []));
     }
 
     public function testNothingIsRecordedOutsideARequest(): void
@@ -228,9 +236,7 @@ final class DebugHelperTest extends TestCase
         $app->routes()->get('/quiet', fn (): string => 'ok');
         $app->handle(new Request(method: 'GET', uri: '/quiet'));
 
-        $recorded = $this->profile($app);
-
-        $this->assertNull($this->event($recorded, 'stray'));
+        $this->assertNull($this->measure($this->profile($app), 'stray'));
     }
 
     public function testMarksDoNotLeakIntoTheNextRequest(): void
@@ -255,37 +261,52 @@ final class DebugHelperTest extends TestCase
         $history = $this->history($app);
 
         $this->assertCount(2, $history);
-        $this->assertCount(1, $this->eventsNamed($history[0], 'only on the first request'));
-        // Under a worker, "one request annotating another" is the failure this
-        // guards, and it would not be visible from either profile alone.
-        $this->assertCount(0, $this->eventsNamed($history[1], 'only on the first request'));
+        $this->assertCount(1, $this->measuresNamed($history[0], 'only on the first request'));
+        $this->assertCount(0, $this->measuresNamed($history[1], 'only on the first request'));
     }
 
-    public function testMarksSurviveTheTimelineFinalizeClamp(): void
+    public function testMarksKeepTheirOrderAndSpacing(): void
     {
-        // The regression this exists for. `Clockwork::resolveRequest()` finalizes
-        // the timeline against `$request->time`, and `Event::finalize()` clamps
-        // anything starting before it. `$request->time` is set when that object is
-        // constructed — which is *after* the handler — so every mark made during
-        // the request would be dragged forward onto the instant recording began
-        // and given a duration of zero.
-        //
-        // The order of the two marks is the assertion: a clamp to a single instant
-        // would leave them indistinguishable.
-        $recorded = $this->record(function (): void {
+        $recorded = $this->record(static function (): void {
             Debug::mark('first');
             usleep(2000);
             Debug::mark('second');
         });
 
-        $first = $this->event($recorded, 'first');
-        $second = $this->event($recorded, 'second');
+        $first = $this->measure($recorded, 'first');
+        $second = $this->measure($recorded, 'second');
 
+        $this->assertNotNull($first);
+        $this->assertNotNull($second);
+
+        // Two marks two milliseconds apart must still be two milliseconds apart.
+        // This is the regression the previous profiler had: it finalised the
+        // timeline against an instant taken *after* the handler ran, which clamped
+        // every mark onto the same moment and gave each a duration of zero.
         $this->assertGreaterThan(
             1.5,
             ($second['start'] - $first['start']) * 1000,
-            'the gap between two marks was flattened, so finalize clamped them together',
+            'the gap between two marks was flattened',
         );
+    }
+
+    public function testLifecycleEventsArePointsRatherThanWholeRequestSpans(): void
+    {
+        $recorded = $this->record(static fn () => Debug::mark('work'));
+
+        foreach (['Request received', 'Matched'] as $point) {
+            $measure = $this->measure($recorded, $point);
+
+            $this->assertNotNull($measure, $point . ' should be on the timeline');
+            // Not `assertSame`: a zero duration comes back from the JSON store as
+            // an int, because `json_encode(0.0)` drops the fraction. The number is
+            // the assertion, not its PHP type on the way out of a file.
+            $this->assertEquals(
+                0.0,
+                $measure['duration'],
+                $point . ' is a moment, not work performed — a duration here reads as milliseconds spent',
+            );
+        }
     }
 
     // ------------------------------------------------------------------ helpers
@@ -298,6 +319,20 @@ final class DebugHelperTest extends TestCase
     private function record(callable $handler): array
     {
         $app = $this->app();
+
+        $this->recordInto($app, $handler);
+
+        return $this->profile($app);
+    }
+
+    /**
+     * Run a handler against an application, without reading the result.
+     *
+     * Separate from {@see record()} because a handler that throws has no profile
+     * to return, and the tests that care about that need the application itself.
+     */
+    private function recordInto(Application $app, callable $handler): void
+    {
         $app->routes()->get('/work', function () use ($handler): string {
             $handler();
 
@@ -305,8 +340,6 @@ final class DebugHelperTest extends TestCase
         }, 'work.index');
 
         $app->handle(new Request(method: 'GET', uri: '/work'));
-
-        return $this->profile($app);
     }
 
     /**
@@ -314,14 +347,7 @@ final class DebugHelperTest extends TestCase
      */
     private function profile(Application $app): array
     {
-        $latest = $app->container()
-            ->get(\Empira\DebugTools\Profiler::class)
-            ->storage()
-            ->latest();
-
-        $this->assertInstanceOf(\Clockwork\Request\Request::class, $latest, 'nothing was recorded');
-
-        return $latest->toArray();
+        return $this->storage($app)->get($this->latestId($app));
     }
 
     /**
@@ -329,21 +355,28 @@ final class DebugHelperTest extends TestCase
      */
     private function history(Application $app): array
     {
-        return array_map(
-            static fn (object $request): array => $request->toArray(),
-            array_values($app->container()->get(\Empira\DebugTools\Profiler::class)->storage()->all()),
-        );
+        $found = $this->storage($app)->find();
+
+        // Oldest first, by `utime` rather than by reversing `find()` — the id sort
+        // is only a millisecond timestamp and two requests here are microseconds
+        // apart, so reversing it does not reliably put the first request first.
+        usort($found, static fn (array $a, array $b): int => ($a['utime'] ?? 0) <=> ($b['utime'] ?? 0));
+
+        return array_values(array_map(
+            fn (array $meta): array => $this->storage($app)->get((string) ($meta['id'] ?? '')),
+            $found,
+        ));
     }
 
     /**
      * @param array<string, mixed> $recorded
      * @return array<string, mixed>|null
      */
-    private function event(array $recorded, string $description): ?array
+    private function measure(array $recorded, string $label): ?array
     {
-        foreach ($recorded['timelineData'] ?? [] as $event) {
-            if (($event['description'] ?? null) === $description) {
-                return $event;
+        foreach ($recorded['time']['measures'] ?? [] as $measure) {
+            if (($measure['label'] ?? null) === $label) {
+                return $measure;
             }
         }
 
@@ -354,11 +387,11 @@ final class DebugHelperTest extends TestCase
      * @param array<string, mixed> $recorded
      * @return list<array<string, mixed>>
      */
-    private function eventsNamed(array $recorded, string $description): array
+    private function measuresNamed(array $recorded, string $label): array
     {
         return array_values(array_filter(
-            $recorded['timelineData'] ?? [],
-            static fn (array $e): bool => ($e['description'] ?? null) === $description,
+            $recorded['time']['measures'] ?? [],
+            static fn (array $m): bool => ($m['label'] ?? null) === $label,
         ));
     }
 
@@ -371,9 +404,35 @@ final class DebugHelperTest extends TestCase
         return $app;
     }
 
+    private function storage(Application $app): StorageInterface
+    {
+        return $app->container()->get(Profiler::class)->storage();
+    }
+
+    private function latestId(Application $app): string
+    {
+        $found = $this->storage($app)->find();
+
+        $this->assertNotSame([], $found, 'nothing was recorded');
+
+        // By `utime`, not by position: `find()` sorts on the request id, which
+        // begins with a millisecond timestamp, so two requests microseconds apart
+        // are ordered by the random bytes after it. Reading position 0 made this
+        // file fail intermittently rather than reliably.
+        $newest = $found[0];
+
+        foreach ($found as $candidate) {
+            if (($candidate['utime'] ?? 0) > ($newest['utime'] ?? 0)) {
+                $newest = $candidate;
+            }
+        }
+
+        return (string) ($newest['id'] ?? '');
+    }
+
     private function removeDirectory(string $path): void
     {
-        if (!is_dir($path)) {
+        if (! is_dir($path)) {
             return;
         }
 

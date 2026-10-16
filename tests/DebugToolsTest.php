@@ -5,12 +5,11 @@ declare(strict_types=1);
 namespace Empira\DebugTools\Tests;
 
 use Empira\Application;
-use Empira\DebugTools\DebugController;
-use Empira\DebugTools\DebugToolsModule;
-use Clockwork\Request\Request as ClockworkRequest;
 use Empira\Console\Output;
 use Empira\DebugTools\Console\ClearCommand;
 use Empira\DebugTools\Console\ShowCommand;
+use Empira\DebugTools\DebugBarController;
+use Empira\DebugTools\DebugToolsModule;
 use Empira\DebugTools\Profiler;
 use Empira\Http\Request;
 use Empira\Http\Response;
@@ -19,11 +18,18 @@ use PHPUnit\Framework\TestCase;
 /**
  * The module, exercised through a real application.
  *
- * Every test here drives `$app->handle()` rather than calling the data source
+ * Every test here drives `$app->handle()` rather than calling the collector
  * directly. That is deliberate: the interesting failures in this kind of module
  * are not in the reading, they are in the wiring — a middleware registered after
  * the pipeline was built, a route that never matches, a storage directory that
  * is one level too high. None of those are visible from the inside.
+ *
+ * ## Injection is asserted by reading the body, not by opening a browser
+ *
+ * There is no browser in this workspace and none is needed. The contract is that
+ * a toolbar is *in* a response body and not in others, and a body is directly
+ * assertable. What a browser would add — that the JavaScript parses and the
+ * panel draws — is upstream DebugBar's own testing, not ours.
  */
 final class DebugToolsTest extends TestCase
 {
@@ -41,23 +47,21 @@ final class DebugToolsTest extends TestCase
         $this->removeDirectory($this->basePath);
     }
 
+    // ------------------------------------------------------------- recording
+
     public function testItRecordsARequestAndNamesTheRouteThatServedIt(): void
     {
         $app = $this->app();
         $app->routes()->get('/things', fn (): string => 'things', 'things.index');
 
-        $response = $app->handle(new Request(method: 'GET', uri: '/things'));
-
-        // The header is the contract the browser interface and the DevTools
-        // panel both rely on, so it is asserted rather than assumed.
-        $this->assertNotNull($response->headers()['X-Clockwork-Id'] ?? null);
+        $app->handle(new Request(method: 'GET', uri: '/things'));
 
         $recorded = $this->latest($app);
 
         $this->assertSame('GET', $recorded['method']);
         $this->assertSame('/things', $recorded['uri']);
-        $this->assertSame(200, $recorded['responseStatus']);
-        $this->assertSame('things.index', $recorded['controller']);
+        $this->assertSame(200, $recorded['status']);
+        $this->assertSame('things.index', $recorded['route']);
     }
 
     public function testItRecordsEachRequestSeparately(): void
@@ -66,13 +70,17 @@ final class DebugToolsTest extends TestCase
         $app->routes()->get('/things', fn (): string => 'things', 'things.index');
         $app->routes()->get('/other', fn (): string => 'other', 'other.index');
 
-        $first = $app->handle(new Request(method: 'GET', uri: '/things'))->headers()['X-Clockwork-Id'];
+        $app->handle(new Request(method: 'GET', uri: '/things'));
         $app->handle(new Request(method: 'GET', uri: '/other'));
 
         $storage = $app->container()->get(Profiler::class)->storage();
 
-        $this->assertNotSame($first, $this->latest($app)['id'], 'the second request should be the latest, not an update of the first');
-        $this->assertCount(2, $storage->all());
+        $this->assertNotSame(
+            $this->latest($app)['uri'],
+            '/things',
+            'the second request should be the latest, not an update of the first',
+        );
+        $this->assertCount(2, $storage->find());
     }
 
     public function testItRecordsTheStatusOfAResponseThatIsNotOk(): void
@@ -88,34 +96,25 @@ final class DebugToolsTest extends TestCase
 
         $app->handle(new Request(method: 'GET', uri: '/nope'));
 
-        $this->assertSame(404, $this->latest($app)['responseStatus']);
+        $this->assertSame(404, $this->latest($app)['status']);
     }
 
     public function testItRecordsTheRequestThatThrewAndRethrowsIt(): void
     {
         $app = $this->app();
         $app->routes()->get('/boom', function (): string {
-            throw new \RuntimeException('the handler exploded');
-        }, 'boom.index');
+            throw new \RuntimeException('it broke');
+        });
 
-        // Whether the application renders the failure or lets it out is its own
-        // choice — with no error view it throws, which is the honest result and
-        // not this module's to decide. What matters either way is that the
-        // profile explaining it was written *before* the throw, since a
-        // profiler that skips exactly the requests you wanted to debug is worse
-        // than no profiler.
         try {
             $app->handle(new Request(method: 'GET', uri: '/boom'));
-        } catch (\Throwable) {
-            // Expected on an application with no error view.
+            $this->fail('the exception should have been rethrown, not swallowed');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('it broke', $e->getMessage());
         }
 
-        $recorded = $this->latest($app);
-
-        $this->assertNotEmpty(
-            $this->errorMessages($recorded),
-            'the thrown handler should appear in the recorded log',
-        );
+        // The one request you most wanted to look at is the one that failed.
+        $this->assertStringContainsString('it broke', (string) $this->latest($app)['error']);
     }
 
     public function testItCollectsNothingWhenDisabled(): void
@@ -123,101 +122,165 @@ final class DebugToolsTest extends TestCase
         $app = $this->app(enabled: false);
         $app->routes()->get('/things', fn (): string => 'things', 'things.index');
 
-        $response = $app->handle(new Request(method: 'GET', uri: '/things'));
-
-        $this->assertSame(200, $response->status());
-        $this->assertArrayNotHasKey('X-Clockwork-Id', $response->headers());
-        $this->assertDirectoryDoesNotExist($this->storagePath());
-    }
-
-    public function testTheInterfaceIsNotRoutableWhenDisabled(): void
-    {
-        $app = $this->app(enabled: false);
-
-        // Not merely refused — absent. The profiler's safety here rests on the
-        // URL not existing, so a 404 from the application itself is the thing
-        // being asserted.
-        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH))->status());
-    }
-
-    public function testThereIsNoHtmlInterfaceToInjectAnythingInto(): void
-    {
-        // Nothing here serves a page, and that is the point: the package ships no
-        // JavaScript and puts nothing into an application's responses. A Clockwork
-        // client is a browser extension reading headers, not markup in your page.
-        //
-        // `/{__clockwork}/{id}` *is* a route, which is the other half of why this
-        // assertion holds: the prefix alone resolves to the latest recorded
-        // request, so there is no HTML to serve there.
-        $app = $this->app();
-
-        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH))->status());
-    }
-
-    public function testAPageIsLeftByteForByteAlone(): void
-    {
-        // The other half of the same decision, and the one that would have caught
-        // the in-page bar: a page comes back exactly as the handler wrote it. A
-        // profiler that rewrites response bodies is a profiler that can corrupt
-        // them.
-        $app = $this->app();
-        $html = "<html><body><p>hi</p>\n</body></html>";
-        $app->routes()->get('/page', fn (): \Empira\Http\Response => \Empira\Http\Response::html($html));
-
-        $this->assertSame($html, $app->handle(new Request(method: 'GET', uri: '/page'))->body());
-    }
-
-    public function testTheInterfaceServesTheApiAsJson(): void
-    {
-        $app = $this->app();
-        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
-
         $app->handle(new Request(method: 'GET', uri: '/things'));
 
-        // The bare prefix, with no id — the shape a client reaches when it has an
-        // `X-Clockwork-Id` but wants the latest rather than a specific request.
-        $response = $app->handle(new Request(method: 'GET', uri: DebugController::PATH));
-
-        $this->assertSame(200, $response->status());
-        $this->assertSame('/things', json_decode($response->body(), true)['uri']);
+        $this->assertSame([], $app->container()->get(Profiler::class)->storage()->find());
     }
 
-    public function testAssetsCannotEscapeThePackage(): void
+    // ------------------------------------------------------------- injection
+
+    public function testTheToolbarIsInjectedIntoAFullHtmlDocument(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/page', fn (): Response => Response::html(
+            '<html><head><title>things</title></head><body><h1>things</h1></body></html>',
+        ));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        // The application's own markup is still there, in order, with the toolbar
+        // after the content rather than replacing it.
+        $this->assertStringContainsString('<h1>things</h1>', $body);
+        $this->assertStringContainsString('debugbar', strtolower($body));
+        $this->assertGreaterThan(
+            strpos($body, '<h1>things</h1>'),
+            (int) strrpos($body, 'debugbar'),
+            'the toolbar belongs after the page content',
+        );
+    }
+
+    public function testTheToolbarStylesheetGoesInTheHead(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/page', fn (): Response => Response::html(
+            '<html><head><title>t</title></head><body></body></html>',
+        ));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        // Before `</head>`, so the toolbar does not flash unstyled.
+        $this->assertLessThan((int) strpos($body, '</head>'), (int) strpos($body, 'debugbar'));
+    }
+
+    public function testNothingIsInjectedIntoJson(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/api', fn (): Response => Response::json(['ok' => true]));
+
+        $response = $app->handle(new Request(method: 'GET', uri: '/api'));
+
+        $this->assertStringNotContainsStringIgnoringCase('debugbar', $response->body());
+        $this->assertSame('{"ok":true}', $response->body(), 'a JSON body must stay byte-identical');
+    }
+
+    public function testNothingIsInjectedIntoAnHtmxSwap(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/fragment', fn (): Response => Response::html('<div>partial</div>'));
+
+        // The case that makes the whole injection rule a correctness condition
+        // rather than a precaution: a swap is answered with a fragment, and a
+        // toolbar appended to one would land inside the element being replaced.
+        $body = $app->handle(new Request(
+            method: 'GET',
+            uri: '/fragment',
+            headers: ['HX-Request' => 'true'],
+        ))->body();
+
+        $this->assertSame('<div>partial</div>', $body);
+    }
+
+    public function testNothingIsInjectedWhenDisabled(): void
+    {
+        $app = $this->app(enabled: false);
+        $app->routes()->get('/page', fn (): Response => Response::html(
+            '<html><head></head><body><h1>quiet</h1></body></html>',
+        ));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        $this->assertSame('<html><head></head><body><h1>quiet</h1></body></html>', $body);
+    }
+
+    public function testNothingIsInjectedIntoAStreamedFile(): void
+    {
+        $app = $this->app();
+        $file = $this->basePath . '/page.html';
+        file_put_contents($file, '<html><body>on disk</body></html>');
+
+        $app->routes()->get('/file', fn (): Response => Response::html('')->stream($file));
+
+        // `stream()` leaves the body empty and the file to be read at emit time, so
+        // there is nothing to rewrite. Injected into, the page would arrive with a
+        // toolbar and a truncated body, or not arrive at all.
+        $response = $app->handle(new Request(method: 'GET', uri: '/file'));
+
+        $this->assertSame('', $response->body());
+    }
+
+    // ---------------------------------------------------------------- routes
+
+    public function testTheAssetsRouteServesJavaScriptAndCss(): void
     {
         $app = $this->app();
 
-        // Reaches the catch-all, and the traversal has to be refused by the
-        // package's own path check rather than by a rule written here.
+        $js = $app->handle(new Request(method: 'GET', uri: DebugBarController::ASSETS, query: ['type' => 'js']));
+        $css = $app->handle(new Request(method: 'GET', uri: DebugBarController::ASSETS, query: ['type' => 'css']));
+
+        $this->assertSame(200, $js->status());
+        $this->assertStringContainsStringIgnoringCase('javascript', $this->header($js, 'content-type'));
+        $this->assertNotSame('', trim($js->body()), 'the script the toolbar needs');
+
+        $this->assertSame(200, $css->status());
+        $this->assertStringContainsString('text/css', $this->header($css, 'content-type'));
+    }
+
+    public function testTheAssetsRouteRefusesAnUnknownType(): void
+    {
+        $app = $this->app();
+
         $response = $app->handle(new Request(
             method: 'GET',
-            uri: DebugController::PATH . '/app/../../../../../../etc/passwd',
+            uri: DebugBarController::ASSETS,
+            query: ['type' => 'php'],
         ));
 
         $this->assertSame(404, $response->status());
     }
 
-    public function testAnAssetPathIsNotSwallowedByTheIdRoute(): void
+    public function testTheOpenHandlerReturnsTheCurrentRequestAsJson(): void
     {
         $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+        $app->handle(new Request(method: 'GET', uri: '/things'));
 
-        // Dropping the `/api` segment put `app/` within the `{id}` route's reach,
-        // so this is the one path that must still fall through to the asset
-        // handler. If the constraint were dropped, `{id}` would take `app` and
-        // answer JSON — the status alone would not catch it, because an unknown
-        // id 404s too, so the content type is what distinguishes the two.
         $response = $app->handle(new Request(
             method: 'GET',
-            uri: DebugController::PATH . '/app/assets/index-159S-Gz-.js',
+            uri: DebugBarController::OPEN_HANDLER,
+            query: ['op' => 'find'],
         ));
 
         $this->assertSame(200, $response->status());
+        $this->assertStringContainsString('application/json', $this->header($response, 'content-type'));
 
-        $headers = $response->headers();
-        $type = strtolower((string) ($headers['Content-Type'] ?? $headers['content-type'] ?? ''));
+        $found = json_decode($response->body(), true);
 
-        $this->assertStringContainsString('javascript', $type, 'served by the asset handler, not the id route');
-        $this->assertNotSame('', trim($response->body()), 'the asset body was served, not an error page');
+        $this->assertIsArray($found);
+        $this->assertNotSame([], $found, 'the recorded request should be listed');
     }
+
+    public function testNeitherEndpointIsRoutableWhenDisabled(): void
+    {
+        $this->assertSame(404, $this->app(enabled: false)->handle(
+            new Request(method: 'GET', uri: DebugBarController::ASSETS, query: ['type' => 'js']),
+        )->status());
+
+        $this->assertSame(404, $this->app(enabled: false)->handle(
+            new Request(method: 'GET', uri: DebugBarController::OPEN_HANDLER, query: ['op' => 'find']),
+        )->status());
+    }
+
+    // --------------------------------------------------------------- commands
 
     public function testClearEmptiesTheRecordedRequests(): void
     {
@@ -226,15 +289,49 @@ final class DebugToolsTest extends TestCase
         $app->handle(new Request(method: 'GET', uri: '/things'));
 
         $storage = $app->container()->get(Profiler::class)->storage();
-        $this->assertNotEmpty($storage->all());
+        $this->assertNotEmpty($storage->find());
 
         [$stream, $output] = $this->recorder();
 
         $exit = (new ClearCommand($app->container()->get(Profiler::class)))->handle([], $output);
 
         $this->assertSame(0, $exit);
-        $this->assertEmpty($storage->all());
+        $this->assertEmpty($storage->find());
         $this->assertStringContainsString('cleared 1', $this->readOutput($stream));
+    }
+
+    public function testClearCanPruneByAgeInstead(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+        $app->handle(new Request(method: 'GET', uri: '/things'));
+
+        $storage = $app->container()->get(Profiler::class)->storage();
+        $this->assertNotEmpty($storage->find());
+
+        [$stream, $output] = $this->recorder();
+
+        $exit = (new ClearCommand($app->container()->get(Profiler::class)))
+            ->handle(['hours' => '24'], $output);
+
+        $this->assertSame(0, $exit);
+        $this->assertStringContainsString('pruned', $this->readOutput($stream));
+        // Nothing is an hour old yet, so pruning by age keeps what it was asked to
+        // keep rather than clearing everything the way `debug:clear` does.
+        $this->assertNotEmpty($storage->find());
+    }
+
+    public function testClearRejectsAnAgeOfLessThanAnHour(): void
+    {
+        $app = $this->app();
+
+        [$stream, $output] = $this->recorder();
+
+        $exit = (new ClearCommand($app->container()->get(Profiler::class)))
+            ->handle(['hours' => '0'], $output);
+
+        $this->assertSame(1, $exit);
+        $this->assertStringContainsString('at least 1', $this->readOutput($stream));
     }
 
     public function testItRegistersItsCommandsThroughTheModule(): void
@@ -280,7 +377,28 @@ final class DebugToolsTest extends TestCase
         $this->assertStringContainsString('no requests', $this->readOutput($stream));
     }
 
-    // ------------------------------------------------------------------ helpers
+    public function testShowExitsNonZeroForARequestThatFailed(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/boom', function (): string {
+            throw new \RuntimeException('it broke');
+        });
+
+        try {
+            $app->handle(new Request(method: 'GET', uri: '/boom'));
+        } catch (\RuntimeException) {
+            // expected
+        }
+
+        [$stream, $output] = $this->recorder();
+
+        $exit = (new ShowCommand($app->container()->get(Profiler::class)))->handle([], $output);
+
+        $this->assertSame(1, $exit);
+        $this->assertStringContainsString('it broke', $this->readOutput($stream));
+    }
+
+    // ---------------------------------------------------------------- helpers
 
     /**
      * A real {@see Output} writing to memory.
@@ -317,65 +435,84 @@ final class DebugToolsTest extends TestCase
         return $app;
     }
 
+    private function storage(Application $app): \DebugBar\Storage\StorageInterface
+    {
+        return $app->container()->get(Profiler::class)->storage();
+    }
+
     /**
-     * The most recently recorded request, as an array.
+     * One response header, case-insensitively.
+     */
+    private function header(Response $response, string $name): string
+    {
+        foreach ($response->headers() as $header => $value) {
+            if (strcasecmp($header, $name) === 0) {
+                return $value;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * The most recently recorded request's `empira` data.
      *
-     * Clockwork's storage answers with a `Request` object — or `false` when
-     * nothing is recorded — so every read in this file goes through here rather
-     * than each test rediscovering which of the three shapes it is holding.
+     * Storage answers with an array, an empty list when nothing is recorded, and
+     * `find()` returns metadata newest-first — so every read in this file goes
+     * through here rather than each test rediscovering which shape it is holding.
      *
      * @return array<string, mixed>
      */
     private function latest(Application $app): array
     {
-        return $this->latestOf($app)->toArray();
-    }
+        $data = $this->storage($app)->get($this->latestId($app));
 
-    private function latestOf(Application $app): ClockworkRequest
-    {
-        $latest = $app->container()->get(Profiler::class)->storage()->latest();
+        $this->assertIsArray($data['empira'] ?? null, 'a request should have been recorded');
 
-        $this->assertInstanceOf(ClockworkRequest::class, $latest, 'a request should have been recorded');
-
-        return $latest;
-    }
-
-    private function storagePath(): string
-    {
-        return $this->basePath . '/storage/clockwork';
+        return $data['empira'];
     }
 
     /**
-     * @param array<string, mixed> $recorded
-     * @return list<string>
+     * The newest request, by `utime` rather than by id.
+     *
+     * `find()` sorts by request id, which begins with a *millisecond* timestamp, so
+     * two requests microseconds apart share that prefix and their order falls to
+     * the random bytes after it. Asserting on `find()[0]` here made this file
+     * fail about one run in three.
+     *
+     * @see \Empira\DebugTools\Console\ShowCommand for why the command has the
+     *      same problem and the same answer.
      */
-    private function errorMessages(array $recorded): array
+    private function latestId(Application $app): string
     {
-        $messages = [];
+        $found = $this->storage($app)->find();
 
-        foreach ($recorded['log'] ?? [] as $entry) {
-            if (is_array($entry) && isset($entry['message']) && is_string($entry['message'])) {
-                $messages[] = $entry['message'];
+        $this->assertNotSame([], $found, 'a request should have been recorded');
+
+        $newest = $found[0];
+
+        foreach ($found as $candidate) {
+            if (($candidate['utime'] ?? 0) > ($newest['utime'] ?? 0)) {
+                $newest = $candidate;
             }
         }
 
-        return $messages;
+        return (string) ($newest['id'] ?? '');
     }
 
-    private function removeDirectory(string $path): void
+    private function removeDirectory(string $directory): void
     {
-        if (!is_dir($path)) {
+        if (! is_dir($directory)) {
             return;
         }
 
-        foreach (new \DirectoryIterator($path) as $item) {
-            if ($item->isDot()) {
-                continue;
-            }
-
-            $item->isDir() ? $this->removeDirectory($item->getPathname()) : @unlink($item->getPathname());
+        foreach (new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        ) as $file) {
+            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
         }
 
-        @rmdir($path);
+        rmdir($directory);
     }
 }

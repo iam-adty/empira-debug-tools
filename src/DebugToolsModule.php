@@ -11,17 +11,24 @@ use Empira\DebugTools\Console\ShowCommand;
 use Empira\Module;
 
 /**
- * Request profiling for an Empira application, backed by Clockwork.
+ * Request profiling for an Empira application, backed by DebugBar.
  *
  * ## What this module is allowed to do on its own
  *
- * It records requests, serves its own interface, and adds a header. It does not
- * touch the application's routes, middleware stack, session, or error handling,
- * and it does not change how anything behaves when it is switched off — with
- * {@see Profiler::isEnabled()} false, nothing is bound, no route is registered
- * and no middleware runs, so an application that installs this and turns it off
- * behaves exactly as it did before, which is the only honest way for a
- * development tool to be optional.
+ * It records requests, serves the toolbar's own two endpoints, and injects that
+ * toolbar into full HTML responses. It does not touch the application's routes,
+ * middleware stack, session, or error handling, and it does not change how anything
+ * behaves when it is switched off — with {@see Profiler::isEnabled()} false,
+ * nothing is bound, no route is registered and no middleware runs, so an
+ * application that installs this and turns it off behaves exactly as it did before,
+ * which is the only honest way for a development tool to be optional.
+ *
+ * ## Injection is confined to whole documents
+ *
+ * Rewriting a response is a strong thing for a module to do, so it is bounded to
+ * responses that are actually pages: not JSON, not an htmx swap, not a streamed
+ * file. See {@see DebugBarMiddleware::shouldInject()} for why each of those is a
+ * correctness condition rather than a precaution.
  *
  * ## Scoping
  *
@@ -70,25 +77,17 @@ final class DebugToolsModule implements Module, CommandProvider
             return;
         }
 
-        $app->use(ClockworkMiddleware::class);
+        $app->use(DebugBarMiddleware::class);
 
-        $controller = new DebugController($container->get(Profiler::class));
+        $controller = new DebugBarController($container->get(Profiler::class));
         $routes = $app->routes();
 
-        // Registration order is matching order, and the asset route is a catch-all,
-        // so the id routes come first. The `[0-9-]+|latest` constraint is what
-        // makes that safe rather than merely conventional: without it
-        // `/app/dashboard.js` matches `{id}` with `id = app` and the asset route is
-        // never reached. It is also Clockwork's own shape — its Slim middleware uses
-        // `([0-9-]+|latest)`.
-        //
-        // There is no HTML page here. Nothing is injected into an application's
-        // responses and this package ships no JavaScript — a Clockwork client reads
-        // the `X-Clockwork-*` headers and fetches `{PATH}/{id}` from below.
-        $routes->get(DebugController::PATH, [$controller, 'api'], 'debug.api', csrf: false);
-        $routes->get(DebugController::PATH . '/{id:[0-9-]+|latest}', [$controller, 'api'], 'debug.api.show', csrf: false);
-        $routes->get(DebugController::PATH . '/{id:[0-9-]+|latest}/{direction}/{count}', [$controller, 'api'], 'debug.api.page', csrf: false);
-        $routes->get(DebugController::PATH . '/app/{path:.*}', [$controller, 'asset'], 'debug.asset', csrf: false);
+        // Two endpoints, and no page between them. DebugBar's interface is an
+        // iframe of its own, built from the stylesheet and script the assets route
+        // hands it, so there is nothing here to serve as HTML and no `{id}` in a
+        // path for anything to collide with.
+        $routes->get(DebugBarController::ASSETS, [$controller, 'assets'], 'debug.assets', csrf: false);
+        $routes->get(DebugBarController::OPEN_HANDLER, [$controller, 'openHandler'], 'debug.open', csrf: false);
     }
 
     public function commands(): array

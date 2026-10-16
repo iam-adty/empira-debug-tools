@@ -5,19 +5,20 @@ declare(strict_types=1);
 namespace Empira\DebugTools\Tests;
 
 use Empira\Application;
-use Empira\DebugTools\DebugController;
+use Empira\DebugTools\DebugBarController;
 use Empira\DebugTools\DebugToolsModule;
 use Empira\DebugTools\Profiler;
 use Empira\Http\Request;
 use PHPUnit\Framework\TestCase;
 
 /**
- * The stored history, and the contract a Clockwork client depends on.
+ * What is stored, and how it gets read back.
  *
- * Everything here reads what was **persisted** — through `FileStorage`, and off
- * the filesystem — rather than the values the recording code returned. The gap
- * that matters is the one between "the handler ran" and "a client can read the
- * result", and nothing in the request path closes it.
+ * The shape of this is DebugBar's rather than ours: one JSON file per request,
+ * found by globbing, with a `__meta` block beside the collectors' data. These
+ * tests are about *our* half of that contract — that an Empira request becomes a
+ * readable record, and that the toolbar can find it again — rather than about
+ * DebugBar's file format, which is upstream's to keep.
  */
 final class StorageHistoryTest extends TestCase
 {
@@ -25,7 +26,7 @@ final class StorageHistoryTest extends TestCase
 
     protected function setUp(): void
     {
-        $this->basePath = sys_get_temp_dir() . '/empira-history-' . bin2hex(random_bytes(6));
+        $this->basePath = sys_get_temp_dir() . '/empira-debug-tools-' . bin2hex(random_bytes(6));
 
         mkdir($this->basePath, 0777, true);
     }
@@ -35,326 +36,194 @@ final class StorageHistoryTest extends TestCase
         $this->removeDirectory($this->basePath);
     }
 
-    /**
-     * The whole integration with the Chrome extension, end to end.
-     *
-     * A client parses `X-Clockwork-Id`, `X-Clockwork-Path` and
-     * `X-Clockwork-Version` off the response, then asks for `{path}/{id}`. It
-     * knows nothing about this package's routes, so **the header is the
-     * contract** — and when the header named the interface prefix rather than
-     * the API base, every client asked for a URL that does not exist. The
-     * application looked perfectly healthy.
-     *
-     * So this does exactly what a browser does: reads the headers, builds the
-     * URL from them, and requests it.
-     */
-    public function testAClientCanGetItsDataFromTheHeadersAlone(): void
+    public function testHistoryGrowsByOnePerRequest(): void
     {
         $app = $this->app();
         $app->routes()->get('/things', fn (): string => 'things', 'things.index');
 
-        $response = $app->handle(new Request(method: 'GET', uri: '/things'));
-        $headers = $this->headerMap($response);
+        $app->handle(new Request(method: 'GET', uri: '/things'));
+        $app->handle(new Request(method: 'GET', uri: '/things'));
 
-        $this->assertArrayHasKey('x-clockwork-id', $headers);
-        $this->assertArrayHasKey('x-clockwork-version', $headers);
-        $this->assertArrayHasKey('x-clockwork-path', $headers);
-
-        $url = $headers['x-clockwork-path'] . '/' . $headers['x-clockwork-id'];
-
-        // Built from the header, not from the constant — if the header
-        // were wrong the two would disagree and this request would 404.
-        $fetched = $app->handle(new Request(method: 'GET', uri: $url));
-
-        $this->assertSame(200, $fetched->status(), "a client following the headers got {$url}");
-
-        $data = json_decode($fetched->body(), true);
-
-        $this->assertSame('/things', $data['uri']);
-        $this->assertSame('things.index', $data['controller']);
-        $this->assertSame(200, $data['responseStatus']);
-        $this->assertSame($headers['x-clockwork-id'], $data['id']);
-    }
-
-    public function testThePathHeaderIsTheBaseAClientAppendsAnIdTo(): void
-    {
-        $app = $this->app();
-        $app->routes()->get('/things', fn (): string => 'things');
-
-        $path = $this->headerMap($app->handle(new Request(method: 'GET', uri: '/things')))['x-clockwork-path'];
-
-        // Clockwork's own prefix, and the base the data hangs off: `{path}/{id}`
-        // is a real route. This used to assert the *opposite* — that the header
-        // was `/_clockwork/api` and therefore NOT the prefix — because this
-        // package carried an `/api` segment upstream does not have. Clockwork's
-        // JavaScript treats the header as an override and otherwise constructs
-        // `/__clockwork/…` itself, so anything else meant one of the two paths
-        // 404'd.
-        $this->assertSame('/__clockwork', $path);
-        $this->assertSame(DebugController::PATH, $path);
-
-        $id = $this->headerMap($app->handle(new Request(method: 'GET', uri: '/things')))['x-clockwork-id'];
-
-        $this->assertSame(
-            200,
-            $app->handle(new Request(method: 'GET', uri: $path . '/' . $id))->status(),
-            'the base the header advertises must resolve with an id appended',
-        );
-    }
-
-    public function testHistoryGrowsByOnePerRequestAndReadsOldestFirst(): void
-    {
-        $app = $this->app();
-
-        foreach (['/a', '/b', '/c'] as $n => $path) {
-            $app->routes()->get($path, fn (): string => 'ok', 'page' . $n);
-            $app->handle(new Request(method: 'GET', uri: $path));
-        }
-
-        $history = $this->history($app);
-
-        $this->assertCount(3, $history);
-        // `all()` walks the index forward, so it is oldest first. A history that
-        // came back newest-first would make "previous" and "next" mean the
-        // opposite of their names.
-        $this->assertSame(['/a', '/b', '/c'], array_column($history, 'uri'));
-
-        $this->assertSame('/c', $this->latest($app)['uri']);
+        $this->assertCount(2, $this->storage($app)->find());
     }
 
     public function testEachRequestIsWrittenToItsOwnFileOnDisk(): void
     {
         $app = $this->app();
-        $app->routes()->get('/written', fn (): string => 'ok', 'written.index');
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
 
-        $id = $this->headerMap($app->handle(new Request(method: 'GET', uri: '/written')))['x-clockwork-id'];
+        $app->handle(new Request(method: 'GET', uri: '/things'));
+        $app->handle(new Request(method: 'GET', uri: '/things'));
 
-        $file = $this->storagePath() . '/' . $id . '.json';
+        $files = glob($this->storagePath($app) . '/*.json') ?: [];
 
-        $this->assertFileExists($file, 'the header names an id with no file behind it');
-
-        $onDisk = json_decode((string) file_get_contents($file), true);
-
-        $this->assertSame($id, $onDisk['id']);
-        $this->assertSame('/written', $onDisk['uri']);
+        // One file per request, because that is what makes a profile readable
+        // without loading all of them, and what `prune()` can delete by age.
+        $this->assertCount(2, $files);
     }
 
-    public function testTheIndexGrowsAsRequestsAreStored(): void
+    public function testTheToolbarCanFindTheRequestItWasProfiling(): void
     {
         $app = $this->app();
-        $app->routes()->get('/n', fn (): string => 'ok');
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
+        $app->handle(new Request(method: 'GET', uri: '/things'));
 
-        $before = $this->indexLines();
-
-        $app->handle(new Request(method: 'GET', uri: '/n'));
-        $app->handle(new Request(method: 'GET', uri: '/n'));
-
-        // The index is the only thing `all()`, `latest()`, `previous()` and
-        // `next()` read. Every read going quiet comes from this file, not from
-        // the per-request files.
-        $this->assertSame($before + 2, $this->indexLines());
-    }
-
-    public function testPreviousAndNextWalkEitherSideOfAnId(): void
-    {
-        $app = $this->app();
-
-        foreach (['/p1', '/p2', '/p3', '/p4'] as $n => $path) {
-            $app->routes()->get($path, fn (): string => 'ok', 'walk' . $n);
-            $app->handle(new Request(method: 'GET', uri: $path));
-        }
-
-        $history = $this->history($app);
-        $middle = $history[1]['id'];
-        $storage = $app->container()->get(Profiler::class)->storage();
-
-        $before = $storage->previous($middle);
-        $after = $storage->next($middle);
-
-        $this->assertSame(['/p1'], array_map(static fn (object $r): string => $r->uri, $before));
-        $this->assertSame(['/p3', '/p4'], array_map(static fn (object $r): string => $r->uri, $after));
-    }
-
-    public function testPagingEndpointsReturnTheSameShapeAsASingleRequest(): void
-    {
-        $app = $this->app();
-
-        foreach (['/q1', '/q2', '/q3'] as $n => $path) {
-            $app->routes()->get($path, function () use ($n): string {
-                usleep(1000);
-
-                return 'ok';
-            }, 'shape' . $n);
-            $app->handle(new Request(method: 'GET', uri: $path));
-        }
-
-        $id = $this->latest($app)['id'];
-
-        $one = json_decode($app->handle(new Request(
+        $response = $app->handle(new Request(
             method: 'GET',
-            uri: DebugController::PATH . '/' . $id,
-        ))->body(), true);
+            uri: DebugBarController::OPEN_HANDLER,
+            query: ['op' => 'get', 'id' => $this->latestId($app)],
+        ));
 
-        $page = json_decode($app->handle(new Request(
+        $this->assertSame(200, $response->status());
+
+        $data = json_decode($response->body(), true);
+
+        $this->assertIsArray($data, 'the open handler returns JSON');
+        $this->assertSame('/things', $data['empira']['uri'] ?? null);
+    }
+
+    public function testAnUnknownIdIsNotFoundRatherThanEmptyData(): void
+    {
+        $app = $this->app();
+
+        $response = $app->handle(new Request(
             method: 'GET',
-            uri: sprintf('%s/%s/previous/5', DebugController::PATH, $id),
-        ))->body(), true);
+            uri: DebugBarController::OPEN_HANDLER,
+            query: ['op' => 'get', 'id' => 'never-recorded'],
+        ));
 
-        $this->assertIsArray($page);
-        $this->assertNotEmpty($page);
-
-        // Every field the single-request response has, on every element of the
-        // page. `previous()`/`next()` answer with *arrays*, and passing those
-        // straight to `json_encode` encodes each object's public properties —
-        // which silently omits every computed field, so a paged client would see
-        // no duration and no query counts for records that have them.
-        foreach (['id', 'uri', 'responseStatus', 'responseDuration', 'memoryUsage', 'timelineData', 'log'] as $field) {
-            $this->assertArrayHasKey($field, $one, "single response is missing {$field}");
-            $this->assertArrayHasKey($field, $page[0], "paged response is missing {$field}");
-        }
+        // DebugBar answers `200` with an empty array, and that is left as it is:
+        // the toolbar's own JavaScript is written against this wire format, and
+        // answering `404` here would be us disagreeing with the client we are
+        // serving. What matters is that the body is empty rather than a profile
+        // that looks real — a stored request would have an `empira` key in it.
+        $this->assertSame(200, $response->status());
+        $this->assertSame([], json_decode($response->body(), true));
     }
 
-    public function testAnUnknownIdIsNotFoundRatherThanNull(): void
+    public function testTheRequestIsReadFromEmpiraAndNotTheSuperglobals(): void
     {
         $app = $this->app();
-        $app->routes()->get('/real', fn (): string => 'ok');
-        $app->handle(new Request(method: 'GET', uri: '/real'));
+        $app->routes()->get('/things', fn (): string => 'things', 'things.index');
 
-        // A well-formed id that was never recorded. It has to satisfy the route's
-        // `{id:[0-9-]+|latest}` constraint, or the request 404s at *routing* and
-        // this would pass without ever reaching the storage it is testing.
-        $response = $app->handle(new Request(method: 'GET', uri: DebugController::PATH . '/1792052326-7296-1076861104'));
+        $app->handle(new Request(method: 'GET', uri: '/things'));
 
-        // `find()` answers `false`, and an empty history answers `[]`. A 200 with
-        // `null` lets a client cache "no such request" as though it were data.
-        $this->assertSame(404, $response->status());
+        $data = $this->stored($app);
+
+        // The whole reason `EmpiraDebugBar` exists. A test constructs its own
+        // `Request` and never touches `$_SERVER`, so a profiler reading the
+        // superglobals here would report the test runner.
+        $this->assertSame('GET', $data['__meta']['method'] ?? null);
+        $this->assertSame('/things', $data['__meta']['uri'] ?? null);
     }
 
-    /**
-     * The lifecycle events are points in time, not spans.
-     *
-     * An event with a `start` and no `end` gets the missing end filled in by
-     * `Event::finalize()` with "now", so it claims to have spanned the whole
-     * request. Three events all reading the same duration — and "Matched" is not
-     * something that takes six milliseconds — is a timeline that misinforms
-     * rather than one that is merely uninformative.
-     */
-    public function testLifecycleEventsArePointsRatherThanWholeRequestSpans(): void
+    public function testTheRequestCollectorsAreNotDebugBarsOwn(): void
     {
         $app = $this->app();
-        $app->routes()->get('/points', function (): string {
-            usleep(2000);
+        $app->routes()->get('/login', fn (): string => 'things');
 
-            return 'ok';
-        }, 'points.index');
+        $app->handle(new Request(
+            method: 'POST',
+            uri: '/login',
+            body: ['password' => 'hunter2'],
+            cookies: ['session' => 'a-real-looking-cookie'],
+        ));
 
-        $app->handle(new Request(method: 'GET', uri: '/points'));
+        $data = $this->stored($app);
 
-        $recorded = $this->latest($app);
+        // DebugBar's own `RequestDataCollector` reads `$_POST` and `$_COOKIE` from
+        // the superglobals unconditionally, and would have written both of these
+        // to disk on every profiled request. It is deliberately not registered;
+        // what arrives is described by `EmpiraCollector` instead.
+        $this->assertArrayNotHasKey('request', $data, 'the superglobal collector must not be registered');
 
-        $this->assertGreaterThan(1.5, $recorded['responseDuration'], 'the request itself took ~2ms');
+        $serialised = json_encode($data);
 
-        foreach ($recorded['timelineData'] as $event) {
-            $this->assertLessThan(
-                0.5,
-                $event['duration'],
-                sprintf('"%s" claims %.2fms, which is the whole request', $event['description'], $event['duration']),
-            );
-        }
+        $this->assertStringNotContainsString('hunter2', (string) $serialised);
+        $this->assertStringNotContainsString('a-real-looking-cookie', (string) $serialised);
+    }
+
+    public function testPayloadsAndCookiesAreOptIn(): void
+    {
+        $app = $this->app(config: ['enabled' => true, 'payloads' => true, 'cookies' => true]);
+        $app->routes()->get('/login', fn (): string => 'things');
+
+        $app->handle(new Request(
+            method: 'POST',
+            uri: '/login',
+            body: ['password' => 'hunter2'],
+            cookies: ['session' => 'a-real-looking-cookie'],
+        ));
+
+        $serialised = (string) json_encode($this->stored($app));
+
+        // Opting in is a deliberate act, and one that can only be made per
+        // installation rather than by anything in the request.
+        $this->assertStringContainsString('hunter2', $serialised);
+        $this->assertStringContainsString('a-real-looking-cookie', $serialised);
     }
 
     public function testTheDataIsNotServedWhenTheModuleIsOff(): void
     {
-        $app = $this->app(enabled: false);
-
-        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH))->status());
-        $this->assertSame(404, $app->handle(new Request(method: 'GET', uri: DebugController::PATH . '/app/index.html'))->status());
+        $this->assertSame(404, $this->app(enabled: false)->handle(
+            new Request(method: 'GET', uri: DebugBarController::OPEN_HANDLER, query: ['op' => 'find']),
+        )->status());
     }
 
-    // ------------------------------------------------------------------ helpers
+    // ---------------------------------------------------------------- helpers
 
     /**
-     * Response headers keyed in lower case, which is how a client reads them:
-     * Clockwork's own bundle compares `l.name.toLowerCase() == 'x-clockwork-id'`.
-     *
-     * An earlier version of this returned the names as written and compared them
-     * directly, which would have failed against a response that spelled a header
-     * differently — the very thing case-insensitivity exists to absorb.
-     *
-     * @return array<string, string>
+     * @param array<string, mixed> $config
      */
-    private function headerMap(\Empira\Http\Response $response): array
+    private function app(bool $enabled = true, array $config = []): Application
     {
-        $map = [];
+        $app = new Application('a-secret-that-is-long-enough');
 
-        foreach ($response->headers() as $name => $value) {
-            $map[strtolower($name)] = $value;
-        }
+        $app->module(new DebugToolsModule($this->basePath, $config + ['enabled' => $enabled]));
 
-        return $map;
+        return $app;
     }
 
-    /**
-     * @return list<array<string, mixed>>
-     */
-    private function history(Application $app): array
+    private function storage(Application $app): \DebugBar\Storage\StorageInterface
     {
-        $all = array_values($app->container()->get(Profiler::class)->storage()->all());
+        return $app->container()->get(Profiler::class)->storage();
+    }
 
-        return array_map(static fn (object $r): array => $r->toArray(), $all);
+    private function storagePath(Application $app): string
+    {
+        return $app->container()->get(Profiler::class)->storagePath();
+    }
+
+    private function latestId(Application $app): string
+    {
+        $found = $this->storage($app)->find();
+
+        $this->assertNotSame([], $found, 'a request should have been recorded');
+
+        return (string) ($found[0]['id'] ?? '');
     }
 
     /**
      * @return array<string, mixed>
      */
-    private function latest(Application $app): array
+    private function stored(Application $app): array
     {
-        $latest = $app->container()->get(Profiler::class)->storage()->latest();
-
-        $this->assertInstanceOf(\Clockwork\Request\Request::class, $latest);
-
-        return $latest->toArray();
+        return $this->storage($app)->get($this->latestId($app));
     }
 
-    private function storagePath(): string
+    private function removeDirectory(string $directory): void
     {
-        return $this->basePath . '/storage/clockwork';
-    }
-
-    private function indexLines(): int
-    {
-        $index = $this->storagePath() . '/index';
-
-        if (!is_file($index)) {
-            return 0;
-        }
-
-        return count(array_filter(explode("\n", (string) file_get_contents($index)), static fn (string $l): bool => trim($l) !== ''));
-    }
-
-    private function app(bool $enabled = true): Application
-    {
-        $app = new Application('a-secret-that-is-long-enough');
-
-        $app->module(new DebugToolsModule($this->basePath, ['enabled' => $enabled]));
-
-        return $app;
-    }
-
-    private function removeDirectory(string $path): void
-    {
-        if (!is_dir($path)) {
+        if (! is_dir($directory)) {
             return;
         }
 
-        foreach (new \DirectoryIterator($path) as $item) {
-            if ($item->isDot()) {
-                continue;
-            }
-
-            $item->isDir() ? $this->removeDirectory($item->getPathname()) : @unlink($item->getPathname());
+        foreach (new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        ) as $file) {
+            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
         }
 
-        @rmdir($path);
+        rmdir($directory);
     }
 }
