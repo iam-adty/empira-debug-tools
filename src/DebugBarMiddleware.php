@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Empira\DebugTools;
 
-use Closure;
 use Empira\Http\Middleware;
 use Empira\Http\Request;
 use Empira\Http\Response;
 use Empira\Routing\RouteCollection;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\RequestHandlerInterface;
 
 /**
  * Records every request through the profiler, puts {@see Debug} in reach of the
@@ -47,13 +49,17 @@ final class DebugBarMiddleware implements Middleware
     ) {
     }
 
-    public function handle(Request $request, Closure $next): Response
+    public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
         if (!$this->profiler->isEnabled()) {
-            return $next($request);
+            return $handler->handle($request);
         }
 
-        $this->profiler->collector()->begin($request, $this->matchRoute($request));
+        // Narrowed, not typed: PSR-15 fixes the parameter at the interface and
+        // PHP will not let it be narrower. An Empira pipeline always passes one.
+        $empira = Request::of($request);
+
+        $this->profiler->collector()->begin($empira, $this->matchRoute($empira));
 
         // The developer-facing `Debug` facade writes here, and only for the
         // duration of this request. Set after `begin()` so a mark cannot land on
@@ -64,7 +70,7 @@ final class DebugBarMiddleware implements Middleware
 
         try {
             try {
-                $response = $next($request);
+                $response = $handler->handle($empira);
             } catch (\Throwable $e) {
                 $this->profiler->collector()->logError($e);
 
@@ -80,7 +86,7 @@ final class DebugBarMiddleware implements Middleware
             $this->profiler->collector()->withResponse($response);
             $this->profiler->record();
 
-            return $this->inject($request, $response);
+            return $this->inject($empira, $response);
         } finally {
             Debug::deactivate();
         }
@@ -101,9 +107,12 @@ final class DebugBarMiddleware implements Middleware
     /**
      * Put the toolbar in the page, when the page is a whole page.
      *
-     * `setBody()` mutates rather than cloning, which is safe here and only here:
-     * this is the outermost response in the pipeline, the handler's copy has
-     * already been returned, and nobody holds another reference to mutate.
+     * Returns a **new** response rather than editing one in place: `Response` is
+     * immutable, so `withHtml()` hands back a modified copy and the one the
+     * handler produced is left exactly as it was. That is better than the
+     * alternative this used to take — mutating a response another layer might
+     * still be holding — but it means the result has to be returned rather than
+     * discarded.
      */
     private function inject(Request $request, Response $response): Response
     {
@@ -128,9 +137,7 @@ final class DebugBarMiddleware implements Middleware
             $body = $head . $body;
         }
 
-        $response->setBody(str_replace('</body>', $script . "\n</body>", $body));
-
-        return $response;
+        return $response->withHtml(str_replace('</body>', $script . "\n</body>", $body));
     }
 
     /**
