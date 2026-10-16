@@ -120,7 +120,23 @@ final class DebugBarMiddleware implements Middleware
             return $response;
         }
 
-        $renderer = $this->profiler->debugBar()->getJavascriptRenderer(DebugBarController::ASSETS);
+        // `getJavascriptRenderer()`'s argument is `$baseUrl` — the web *root*,
+        // used to resolve a collector's own assets — and **not** the assets
+        // endpoint. Passing `ASSETS` there bought nothing at all: `renderHead()`
+        // only serves from `$assetHandlerUrl`, so with that null it fell back to
+        // joining `$baseUrl` with the file path, and every page asked for
+        // `/__debugbar/assets/dist/debugbar.min.css`. That matches no route,
+        // because the endpoint serves by `?type=css` and not by path — so the
+        // toolbar's stylesheet and script both 404'd, and the 45-test suite was
+        // green throughout. See `testEveryAssetTheToolbarAsksForResolves`.
+        //
+        // Both URLs, or neither works. The open handler is the silent half: with
+        // it unset, `render()` never emits `setOpenHandler(...)`, so the toolbar
+        // would draw once the assets loaded and could never fetch stored data —
+        // no 404, and nothing in any log.
+        $renderer = $this->profiler->debugBar()->getJavascriptRenderer();
+        $renderer->setAssetHandlerUrl(DebugBarController::ASSETS);
+        $renderer->setOpenHandlerUrl(DebugBarController::OPEN_HANDLER);
 
         $body = $response->body();
 

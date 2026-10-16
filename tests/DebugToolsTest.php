@@ -162,6 +162,90 @@ final class DebugToolsTest extends TestCase
         $this->assertLessThan((int) strpos($body, '</head>'), (int) strpos($body, 'debugbar'));
     }
 
+    /**
+     * Every URL the toolbar puts in the page is a URL this application answers.
+     *
+     * This is the join, and it is the assertion whose absence let a toolbar
+     * ship that asked for `/__debugbar/assets/dist/debugbar.min.css` — a path
+     * matching no route, because the endpoint serves by `?type=css` — while all
+     * 45 tests stayed green.
+     *
+     * The two tests that were here already covered both halves. One asserted the
+     * word "debugbar" appeared in the body, which a broken URL satisfies; the
+     * other built `/__debugbar/assets?type=js` **by hand** and proved it answered.
+     * Neither ever took the URL out of the page and asked for it.
+     *
+     * So this takes the URLs out of the page and asks for them. No browser: the
+     * routing table does not depend on who is asking, and a browser would answer
+     * the weaker question — "did anything appear" — at the cost of 300MB of
+     * Chromium.
+     */
+    public function testEveryAssetTheToolbarAsksForResolves(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/page', fn (): Response => Response::html(
+            '<html><head><title>t</title></head><body><h1>hi</h1></body></html>',
+        ));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        preg_match_all('/<link[^>]+href="([^"]+)"|<script[^>]+src="([^"]+)"/', $body, $matches, PREG_SET_ORDER);
+
+        $urls = array_values(array_filter(array_map(
+            static fn (array $m): string => $m[1] !== '' ? $m[1] : ($m[2] ?? ''),
+            $matches,
+        )));
+
+        $this->assertNotEmpty($urls, 'no asset URLs were injected, so this would pass vacuously');
+
+        foreach ($urls as $url) {
+            $query = [];
+            parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
+
+            $response = $app->handle(new Request(
+                method: 'GET',
+                uri: (string) parse_url($url, PHP_URL_PATH),
+                query: $query,
+            ));
+
+            $this->assertSame(200, $response->status(), "the page asks for {$url} and gets {$response->status()}");
+        }
+    }
+
+    /**
+     * The toolbar is told where to fetch stored data from.
+     *
+     * The silent half of the same bug, and the one that would have survived a
+     * green console. With `openHandlerUrl` unset, `render()` simply never emits
+     * `setOpenHandler(...)`: no 404, nothing in any log, and a toolbar that
+     * draws perfectly and cannot read a thing. Asserting that the page carries
+     * the URL is the only way to notice, because nothing downstream complains.
+     */
+    public function testTheToolbarIsToldWhereToFetchStoredDataFrom(): void
+    {
+        $app = $this->app();
+        $app->routes()->get('/page', fn (): Response => Response::html(
+            '<html><head><title>t</title></head><body><h1>hi</h1></body></html>',
+        ));
+
+        $body = $app->handle(new Request(method: 'GET', uri: '/page'))->body();
+
+        // Matched out and decoded rather than asserted as a substring, because
+        // the URL is embedded as JSON and `json_encode` escapes every slash:
+        // the page carries `\/__debugbar\/openhandler`, which a plain
+        // `assertStringContainsString('/__debugbar/openhandler')` reports as
+        // missing. Testing the decoded value says what is actually meant.
+        preg_match('/setOpenHandler\([^)]*\(\{"url":"(.+?)"\}\)/', $body, $matches);
+
+        $this->assertArrayHasKey(1, $matches, 'the toolbar was never told where to fetch stored data');
+
+        $this->assertSame(
+            DebugBarController::OPEN_HANDLER,
+            json_decode('"' . $matches[1] . '"', true),
+            'the toolbar would fetch stored data from the wrong URL'
+        );
+    }
+
     public function testNothingIsInjectedIntoJson(): void
     {
         $app = $this->app();
